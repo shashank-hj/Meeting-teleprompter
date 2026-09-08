@@ -1,0 +1,63 @@
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated local databases and vector indexes
+*.db
+*.sqlite
+*.sqlite3
+chroma_db/
+chroma_verify_db/
+kb_verify.db
+
+# Temporary uploads and extracted media
+teleprompter_uploads/
+uploads/
+*.wav
+*.mp3
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+*.flac
+*.m4a
+
+# Local model/runtime artifacts
+models/
+*.gguf
+*.onnx
+*.bin
+
+# Build and packaging output
+build/
+dist/
+*.spec
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+

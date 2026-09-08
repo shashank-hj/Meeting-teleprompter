@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Architecture proposal for a private, local, real-time Windows meeting teleprompter.">
+<title>Local Real-Time Meeting Teleprompter — Design Proposal</title>
+<style>
+:root{color-scheme:light;--ink:#172033;--muted:#5d687c;--line:#dce2eb;--paper:#fff;--wash:#f4f7fb;--accent:#3157d5;--accent2:#12a594}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--wash);color:var(--ink);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{background:linear-gradient(135deg,#172b58,#3157d5 62%,#12a594);color:#fff;padding:4.5rem 1.5rem 3.5rem}
+.hero{max-width:920px;margin:auto}.eyebrow{font-size:.78rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;opacity:.8}
+header h1{font-size:clamp(2.2rem,6vw,4.4rem);line-height:1.05;margin:.5rem 0 1rem;letter-spacing:-.04em}header p{max-width:720px;font-size:1.15rem;opacity:.9}
+.layout{display:grid;grid-template-columns:240px minmax(0,920px);gap:2.5rem;max-width:1240px;margin:0 auto;padding:2rem 1.5rem 5rem}
+nav{position:sticky;top:1.5rem;align-self:start;max-height:calc(100vh - 3rem);overflow:auto;background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:1rem;box-shadow:0 8px 30px #22345d12}
+nav strong{display:block;margin:0 0 .55rem}nav a{display:block;color:var(--muted);text-decoration:none;padding:.25rem 0;font-size:.86rem}nav a:hover{color:var(--accent)}
+main{background:var(--paper);border:1px solid var(--line);border-radius:18px;padding:clamp(1.25rem,4vw,3.5rem);box-shadow:0 12px 40px #22345d12;min-width:0}
+h1{font-size:2.35rem;line-height:1.15}main>h1:first-child{display:none}h2{font-size:1.65rem;margin-top:2.7rem;padding-top:.5rem;border-top:1px solid var(--line)}h3{font-size:1.18rem;margin-top:2rem}h4{font-size:1rem}
+a{color:var(--accent)}code{background:#edf1f7;border-radius:5px;padding:.12rem .35rem;font-size:.9em}pre{overflow:auto;background:#111a2b;color:#eaf0ff;border-radius:12px;padding:1.15rem;font-size:.84rem;line-height:1.45}pre code{background:transparent;color:inherit;padding:0;border-radius:0}
+table{border-collapse:collapse;width:100%;display:block;overflow-x:auto;margin:1.25rem 0}th,td{border:1px solid var(--line);padding:.65rem .8rem;text-align:left;vertical-align:top}th{background:#eef3fb}blockquote{border-left:4px solid var(--accent2);margin:1.5rem 0;padding:.4rem 1rem;color:var(--muted);background:#f3fbf9}
+li{margin:.3rem 0}hr{border:0;border-top:1px solid var(--line)}footer{max-width:920px;margin:0 auto 3rem;padding:0 1.5rem;color:var(--muted);font-size:.85rem}
+@media(max-width:850px){.layout{display:block;padding:1rem}.layout nav{position:static;max-height:none;margin-bottom:1rem}nav a{display:none}main{border-radius:14px}header{padding-top:3rem}}
+@media print{body{background:#fff}.layout{display:block;padding:0}nav{display:none}main{border:0;box-shadow:none;padding:0}header{background:none;color:#000;padding:0 0 2rem}footer{display:none}a{color:#000;text-decoration:none}}
+</style>
+</head>
+<body>
+<header><div class="hero"><div class="eyebrow">Architecture proposal · 29 August 2026</div><h1>Local Real-Time<br>Meeting Teleprompter</h1><p>A private Windows assistant that follows live calls, retrieves local knowledge, and proactively surfaces grounded answers on CPU-only hardware.</p></div></header>
+<div class="layout">
+<nav aria-label="Document navigation"><strong>Contents</strong>
+<a href="#1-product-idea">1. Product idea</a><a href="#2-goals">2. Goals</a><a href="#3-non-goals-for-the-first-version">3. Non-goals</a><a href="#4-confirmed-product-decisions">4. Decisions</a><a href="#5-feasibility-assessment">5. Feasibility</a><a href="#6-recommended-technical-approach">6. Technical approach</a><a href="#7-recommended-model-stack">7. Model stack</a><a href="#8-system-architecture">8. Architecture</a><a href="#9-source-ingestion">9. Sources</a><a href="#10-scheduling-and-resource-control">10. Scheduling</a><a href="#11-indicative-memory-budget">11. Memory</a><a href="#12-reliability-privacy-and-safety">12. Safety</a><a href="#13-testing-and-evaluation">13. Testing</a><a href="#14-proposed-mvp-sequence">14. MVP sequence</a><a href="#15-decisions-intentionally-deferred">15. Deferred</a><a href="#16-references">16. References</a><a href="#addendum-edge-intelligence-runtime-research">Addendum: Edge runtimes</a>
+</nav>
+<main>
+<h1 id="local-real-time-meeting-teleprompter">Local Real-Time Meeting Teleprompter</h1>
+<p><strong>Status:</strong> Proposed architecture<br />
+<strong>Date:</strong> 29 August 2026<br />
+<strong>Initial platform:</strong> Windows 10/11, CPU-only, 16 GB RAM</p>
+<h2 id="1-product-idea">1. Product idea</h2>
+<p>Build a Windows desktop application or widget that listens to live Google Meet, Zoom, and Microsoft Teams calls, follows the conversation in real time, retrieves relevant material from user-provided sources, and proactively presents useful information or suggested responses.</p>
+<p>The product should behave like an intelligent teleprompter rather than a conventional chatbot. It should keep listening and updating its suggestions without requiring a direct question or prompt. Suggestions may offer user-selectable routes such as generating a concise answer, finding supporting evidence, explaining a concept, checking a claim, searching indexed sources, searching the web, or suggesting a follow-up question.</p>
+<p>The application should run its speech recognition, retrieval, embeddings, conversation tracking, and answer generation locally. Network access is limited to fetching user-provided URLs and, if introduced later, explicitly enabled live web search.</p>
+<h2 id="2-goals">2. Goals</h2>
+<ul>
+<li>Capture meeting audio without separate integrations for Meet, Zoom, and Teams.</li>
+<li>Maintain a continuously updated transcript and compact conversation state.</li>
+<li>Surface relevant information even when nobody asks a direct question.</li>
+<li>Ground suggestions in local files and user-provided web pages.</li>
+<li>Preserve citations and source freshness information.</li>
+<li>Keep meeting audio, transcripts, embeddings, and model inference on the device.</li>
+<li>Remain usable on a Windows computer with 16 GB RAM and no dedicated GPU.</li>
+<li>Keep transcription responsive while lower-priority retrieval and generation work is running.</li>
+<li>Make models and inference runtimes replaceable as better edge models become available.</li>
+</ul>
+<h2 id="3-non-goals-for-the-first-version">3. Non-goals for the first version</h2>
+<ul>
+<li>Separate integrations with each conferencing product.</li>
+<li>Fully autonomous participation in calls.</li>
+<li>Reliable identification of every remote speaker.</li>
+<li>Continuous deep reasoning over every transcript fragment.</li>
+<li>Automatic refreshing of saved web sources.</li>
+<li>Cloud-hosted transcription, embeddings, or answer generation.</li>
+<li>Detailed optimization of the final card layout and interaction design.</li>
+</ul>
+<h2 id="4-confirmed-product-decisions">4. Confirmed product decisions</h2>
+<h3 id="platform-and-hardware">Platform and hardware</h3>
+<ul>
+<li>Windows is the initial and only required platform.</li>
+<li>The baseline machine has 16 GB of system RAM and uses CPU inference.</li>
+<li>The design must not assume a dedicated GPU, although optional integrated-GPU or NPU acceleration can be added later.</li>
+</ul>
+<h3 id="interaction-model">Interaction model</h3>
+<ul>
+<li>The application listens continuously during an active session.</li>
+<li>It updates suggestions in real time as the discussion changes.</li>
+<li>It may suggest information when topics, entities, claims, risks, or decisions arise, even without a recognizable direct question.</li>
+<li>Suggestions can expose multiple clickable routes that let the user choose how to pursue the topic.</li>
+<li>Detailed behavior for expanding, replacing, or focusing suggestion cards is intentionally deferred.</li>
+</ul>
+<h3 id="sources">Sources</h3>
+<ul>
+<li>Users can select one or more local directories.</li>
+<li>Users can provide web links.</li>
+<li>A web link is fetched and indexed immediately when it is added.</li>
+<li>The indexed copy remains unchanged until the user explicitly refreshes it, re-adds the link, or uses a <strong>Refresh sources</strong> action.</li>
+<li>Retrieval results should retain the original URL and the time at which the page was fetched.</li>
+<li>Automatic periodic URL refresh is not part of the initial design.</li>
+</ul>
+<h2 id="5-feasibility-assessment">5. Feasibility assessment</h2>
+<p>The application is feasible on a CPU-only Windows machine with 16 GB RAM if it uses small specialized models and aggressively prioritizes work.</p>
+<p>The system should not run a generative model against every partial transcript. Audio capture and transcription must remain continuous, while proactive generations are selective, bounded, cancellable, and limited to short outputs.</p>
+<p>Latency depends heavily on the exact CPU. Reasonable design targets, to be validated on representative hardware, are:</p>
+<ul>
+<li>Partial transcript updates approximately 1–4 seconds behind speech.</li>
+<li>Retrieval results approximately 1–3 seconds after a topic or question trigger.</li>
+<li>Short generated suggestions commonly within approximately 4–15 seconds.</li>
+</ul>
+<p>These are engineering targets rather than guarantees. The application should benchmark the device during setup and expose a low-latency model profile when a larger model cannot keep pace.</p>
+<h3 id="meaning-of-local">Meaning of local</h3>
+<p>Strictly offline operation can include audio capture, transcription, file ingestion, embeddings, retrieval, and generation, but it cannot fetch new web content. Fetching a supplied URL or performing live web search necessarily uses the network.</p>
+<p>The intended privacy boundary is therefore:</p>
+<ul>
+<li>Meeting audio and transcripts stay on the computer.</li>
+<li>Local document content and embeddings stay on the computer.</li>
+<li>Model inference stays on the computer.</li>
+<li>Only URLs explicitly supplied by the user are fetched in the initial version.</li>
+<li>Any future search feature should send a distilled search query, not the meeting transcript or private source material, and should be explicitly enabled.</li>
+</ul>
+<h2 id="6-recommended-technical-approach">6. Recommended technical approach</h2>
+<p>Use a native C# application with isolated native inference workers.</p>
+<h3 id="application-layer">Application layer</h3>
+<ul>
+<li><strong>Language/runtime:</strong> C# and .NET 10.</li>
+<li><strong>Desktop framework:</strong> WinUI 3 with Windows App SDK 2.4.</li>
+<li><strong>Windows integration:</strong> CsWin32 or focused P/Invoke wrappers for audio, hotkeys, window behavior, and process control.</li>
+<li><strong>Packaging:</strong> MSIX, with model assets downloaded or installed separately.</li>
+</ul>
+<p>WinUI 3 is Microsoft's recommended framework for new native Windows desktop applications. A native application is preferred over an Electron-style shell because the target machine has limited RAM and must run multiple inference workloads alongside a conferencing application.</p>
+<h3 id="inference-isolation">Inference isolation</h3>
+<p>Speech recognition and language generation should run in separate local worker processes rather than inside the UI process. The workers communicate with the application through named pipes using versioned JSON messages.</p>
+<p>This provides:</p>
+<ul>
+<li>UI responsiveness when inference is busy.</li>
+<li>Cancellation and restart boundaries.</li>
+<li>Crash isolation.</li>
+<li>Independent model and runtime upgrades.</li>
+<li>Straightforward performance measurement.</li>
+</ul>
+<h3 id="alternatives-considered">Alternatives considered</h3>
+<ol>
+<li><strong>Rust with Tauri:</strong> smaller distribution and attractive for future cross-platform work, but Windows audio, overlay, accessibility, and packaging integration would require more effort.</li>
+<li><strong>Python with Qt:</strong> fastest for a disposable prototype and rich in ML libraries, but harder to package and control reliably as a polished Windows product.</li>
+</ol>
+<p>The C# and native-worker architecture is the recommended product direction. Python remains useful for offline model evaluation and experiments, not as the main shipped application runtime.</p>
+<h2 id="7-recommended-model-stack">7. Recommended model stack</h2>
+<h3 id="speech-recognition">Speech recognition</h3>
+<p><strong>Initial choice:</strong> <code>whisper.cpp</code> with Whisper <code>base.en</code>.</p>
+<p>Reasons:</p>
+<ul>
+<li>Mature C/C++ implementation with Windows and CPU support.</li>
+<li>Streaming example and controllable inference parameters.</li>
+<li>Approximately 388 MB reported working memory for <code>base</code>.</li>
+<li>OpenVINO acceleration is available on compatible Intel hardware.</li>
+<li>The model can be upgraded to <code>small.en</code> when accuracy warrants the additional CPU and memory cost.</li>
+</ul>
+<p><strong>Evaluation candidate:</strong> Qwen3-ASR 0.6B Q8.</p>
+<p>Qwen3-ASR is a newer streaming and multilingual option. It should be benchmarked against <code>whisper.cpp</code> on representative Windows x86 CPUs before adoption because readily published CPU figures are not sufficient to establish Windows performance.</p>
+<h3 id="language-generation">Language generation</h3>
+<p><strong>Initial choice:</strong> Gemma 4 E2B Instruct in Q4 GGUF format, served by <code>llama.cpp</code>.</p>
+<p>Reasons:</p>
+<ul>
+<li>Designed for edge and mobile deployment.</li>
+<li>Official quantized GGUF checkpoints are available.</li>
+<li>Its size leaves room for the conferencing client, speech recognition, retrieval, and Windows within 16 GB RAM.</li>
+<li>It is suitable for short grounded responses, summaries, route selection, and citation-aware formatting.</li>
+</ul>
+<p><strong>Higher-quality option:</strong> Gemma 4 E4B Q4, enabled only when an installation-time benchmark shows acceptable generation speed and memory headroom.</p>
+<p><strong>Alternative:</strong> Qwen3.5 2B, subject to comparative testing for instruction following, grounded response quality, generation speed, and stable GGUF support.</p>
+<p>Models in the 7B–12B range may fit when heavily quantized, but they are not recommended for this baseline. Fitting into memory does not mean they can generate quickly while the meeting application and ASR are active.</p>
+<h3 id="embeddings">Embeddings</h3>
+<p><strong>Choice:</strong> EmbeddingGemma 300M in Q8 or Q4 form.</p>
+<p>Reasons:</p>
+<ul>
+<li>Designed for on-device retrieval.</li>
+<li>Supports multilingual text.</li>
+<li>Provides flexible embedding dimensions.</li>
+<li>Requires under approximately 200 MB RAM when suitably quantized, according to its documentation.</li>
+</ul>
+<h3 id="voice-activity-detection">Voice activity detection</h3>
+<p><strong>Choice:</strong> Silero VAD through ONNX Runtime.</p>
+<p>VAD reduces unnecessary ASR work and provides useful speech-boundary events. It must remain a replaceable component so it can be tuned or substituted based on meeting-audio tests.</p>
+<h2 id="8-system-architecture">8. System architecture</h2>
+<pre><code class="language-text">Google Meet / Zoom / Teams
+             │
+             ├── WASAPI loopback: remote/system audio
+             └── microphone capture: local speaker
+                         │
+                   audio service
+                         │
+                    voice activity
+                         │
+              whisper.cpp streaming ASR
+                         │
+              transcript stabilization
+                         │
+              conversation state engine
+                 ┌───────┴────────┐
+                 │                │
+        proactive trigger     session history
+              engine               │
+                 │                 │
+                 └───────┬─────────┘
+                         │
+                  hybrid retrieval
+                 ┌───────┴──────────┐
+                 │                  │
+          SQLite FTS5        EmbeddingGemma
+                                    │
+                               sqlite-vec
+                 └───────┬──────────┘
+                         │
+                 evidence selection
+                         │
+               Gemma 4 E2B / llama.cpp
+                         │
+                live suggestion stream
+</code></pre>
+<h3 id="audio-capture">Audio capture</h3>
+<p>Use Windows Audio Session API loopback capture for system audio and a normal capture endpoint for the microphone. Keeping these channels separate provides a useful distinction between the local user and remote participants without running expensive speaker diarization.</p>
+<p>The first version does not need to distinguish individual remote participants reliably.</p>
+<h3 id="transcript-stabilization">Transcript stabilization</h3>
+<p>Streaming ASR emits partial and revised text. A transcript stabilizer should:</p>
+<ul>
+<li>Track partial and final segments.</li>
+<li>Prevent repeated words and overlapping windows from entering the canonical transcript.</li>
+<li>Preserve timestamps and audio-channel identity.</li>
+<li>Emit stable sentence or utterance events for downstream processing.</li>
+<li>Allow corrections without repeatedly triggering the same suggestion.</li>
+</ul>
+<h3 id="conversation-state">Conversation state</h3>
+<p>Maintain two related forms of state:</p>
+<ul>
+<li>A short verbatim window containing the most recent stable utterances.</li>
+<li>A compact rolling summary of topics, entities, questions, claims, decisions, and unresolved items.</li>
+</ul>
+<p>The rolling summary must have a strict token budget. It should be updated less frequently than the transcript and should not require an expensive generation for every utterance.</p>
+<h3 id="proactive-trigger-engine">Proactive trigger engine</h3>
+<p>The trigger engine decides whether new conversation material merits retrieval or generation. It should combine inexpensive signals:</p>
+<ul>
+<li>Direct or implied questions.</li>
+<li>Topic and named-entity changes.</li>
+<li>Claims that may benefit from evidence.</li>
+<li>Numbers, dates, product names, people, or organizations found in indexed sources.</li>
+<li>Decisions, objections, risks, and unresolved action items.</li>
+<li>Semantic similarity between the current conversation and indexed content.</li>
+<li>Cooldowns, deduplication, and novelty thresholds.</li>
+</ul>
+<p>Retrieval can happen more often than generation. An LLM call should occur only when there is sufficient evidence that a suggestion will be useful.</p>
+<h3 id="hybrid-retrieval">Hybrid retrieval</h3>
+<p>Use both lexical and vector retrieval:</p>
+<ul>
+<li>SQLite FTS5 handles exact names, acronyms, identifiers, and quoted phrases.</li>
+<li>EmbeddingGemma with <code>sqlite-vec</code> handles semantic similarity.</li>
+<li>A small fusion layer combines and deduplicates results.</li>
+<li>The evidence selector favors fresh, directly relevant, and diverse passages.</li>
+<li>Generated suggestions must retain references to the underlying chunks and sources.</li>
+</ul>
+<p>A dedicated neural reranker is deferred. It adds memory and CPU pressure and should be introduced only if measured retrieval quality requires it.</p>
+<h2 id="9-source-ingestion">9. Source ingestion</h2>
+<h3 id="local-directories">Local directories</h3>
+<p>The initial supported formats should be PDF, DOCX, Markdown, plain text, and HTML.</p>
+<p>Proposed libraries:</p>
+<ul>
+<li>PdfPig for PDF text extraction.</li>
+<li>Open XML SDK for DOCX.</li>
+<li>AngleSharp for HTML parsing.</li>
+<li>Native text and Markdown parsing for simple formats.</li>
+</ul>
+<p>Ingestion flow:</p>
+<ol>
+<li>Monitor configured folders with <code>FileSystemWatcher</code>.</li>
+<li>Debounce duplicate and partial-write events.</li>
+<li>Extract text and structural metadata.</li>
+<li>Split content using headings, paragraphs, lists, and page boundaries where available.</li>
+<li>Store source metadata and a content hash.</li>
+<li>Generate embeddings for changed chunks only.</li>
+<li>Update the lexical and vector indexes transactionally.</li>
+</ol>
+<h3 id="web-links">Web links</h3>
+<p>URL ingestion flow:</p>
+<ol>
+<li>Validate the URL and apply network-safety rules.</li>
+<li>Fetch immediately with an HTTP client.</li>
+<li>Enforce redirect, response-size, timeout, MIME-type, and scheme limits.</li>
+<li>Extract the page's primary readable content.</li>
+<li>Record the canonical URL, title, fetched timestamp, content hash, and retrieval status.</li>
+<li>Chunk and index the extracted text locally.</li>
+<li>Fall back to Playwright using installed Microsoft Edge only when ordinary HTTP extraction cannot obtain useful content from a JavaScript-rendered page.</li>
+</ol>
+<p>The indexed page is a snapshot. It is refreshed only through explicit user action. Authentication-protected sources, robots and site terms, paywalls, and pages that prohibit automated access require careful handling and are not assumed to work in the first version.</p>
+<h2 id="10-scheduling-and-resource-control">10. Scheduling and resource control</h2>
+<p>CPU scheduling is a core product requirement, not a later optimization. Each subsystem should submit cancellable work to bounded queues.</p>
+<p>Priority order:</p>
+<ol>
+<li>Audio capture, which must never wait on model work.</li>
+<li>VAD and ASR.</li>
+<li>User-requested retrieval.</li>
+<li>User-requested generation.</li>
+<li>Proactive retrieval.</li>
+<li>Proactive generation.</li>
+<li>File indexing and URL refresh.</li>
+</ol>
+<p>Only one language-model generation should run at a time on the baseline machine. A newer high-priority request should cancel an obsolete proactive generation. Background indexing should pause or throttle during active calls.</p>
+<p>Suggested response length should normally be constrained to approximately 40–100 tokens. The UI can request a longer continuation when the user explicitly chooses a route requiring more detail.</p>
+<h2 id="11-indicative-memory-budget">11. Indicative memory budget</h2>
+<table>
+<thead>
+<tr>
+<th>Workload</th>
+<th style="text-align: right;">Indicative allocation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Windows and meeting client</td>
+<td style="text-align: right;">5–8 GB</td>
+</tr>
+<tr>
+<td>Desktop application and UI</td>
+<td style="text-align: right;">Under 500 MB target</td>
+</tr>
+<tr>
+<td>Whisper ASR</td>
+<td style="text-align: right;">Approximately 400–900 MB</td>
+</tr>
+<tr>
+<td>Gemma 4 E2B Q4 and context</td>
+<td style="text-align: right;">Approximately 2–4 GB</td>
+</tr>
+<tr>
+<td>Embeddings, database, and retrieval</td>
+<td style="text-align: right;">Approximately 300–700 MB</td>
+</tr>
+<tr>
+<td>Desired safety margin</td>
+<td style="text-align: right;">2–3 GB</td>
+</tr>
+</tbody>
+</table>
+<p>Actual consumption must be measured. Context length, model implementation, page extraction, browser fallback, and the chosen conferencing client can substantially affect the total.</p>
+<h2 id="12-reliability-privacy-and-safety">12. Reliability, privacy, and safety</h2>
+<ul>
+<li>Show an unambiguous listening indicator and explicit session start/stop controls.</li>
+<li>Make transcript persistence opt-in; support an ephemeral session mode.</li>
+<li>Do not include raw transcripts in routine logs.</li>
+<li>Store local indexes in a user-controlled application-data location.</li>
+<li>Support deleting a source and all derived chunks and embeddings.</li>
+<li>Label suggestions as generated assistance and keep citations visible.</li>
+<li>Do not present uncertain generated content as verified fact.</li>
+<li>Track transcript confidence and avoid strong suggestions from unstable text.</li>
+<li>Treat downloaded content and documents as untrusted input; source text must never override application-level instructions.</li>
+<li>Protect URL fetching against local-network access, unsupported schemes, excessive redirects, very large downloads, and decompression bombs.</li>
+<li>Respect organizational policy, participant expectations, and applicable consent requirements for meeting capture and transcription.</li>
+</ul>
+<h2 id="13-testing-and-evaluation">13. Testing and evaluation</h2>
+<h3 id="model-evaluation">Model evaluation</h3>
+<p>Create a representative, locally controlled meeting-audio corpus containing clean speech, accents, cross-talk, conferencing compression, background noise, names, acronyms, and domain terminology.</p>
+<p>Compare candidate ASR models on:</p>
+<ul>
+<li>Word error rate and domain-term accuracy.</li>
+<li>Stable partial-transcript latency.</li>
+<li>Real-time factor on baseline CPUs.</li>
+<li>Peak RAM and sustained CPU usage.</li>
+</ul>
+<p>Compare candidate LLMs on:</p>
+<ul>
+<li>Groundedness in retrieved passages.</li>
+<li>Citation correctness.</li>
+<li>Short-answer usefulness.</li>
+<li>Instruction following.</li>
+<li>Time to first token and tokens per second.</li>
+<li>Peak RAM while ASR remains active.</li>
+</ul>
+<h3 id="component-tests">Component tests</h3>
+<ul>
+<li>Audio buffer overflow and device changes.</li>
+<li>Partial transcript revision and deduplication.</li>
+<li>Trigger cooldowns and stale-work cancellation.</li>
+<li>Chunking and source-location preservation.</li>
+<li>Hybrid retrieval ranking.</li>
+<li>URL validation, timeouts, content limits, and refresh behavior.</li>
+<li>File changes, deletions, renames, and interrupted writes.</li>
+<li>Worker crash and restart recovery.</li>
+</ul>
+<h3 id="end-to-end-acceptance-tests">End-to-end acceptance tests</h3>
+<ul>
+<li>The transcript remains responsive throughout a representative call.</li>
+<li>Adding a local folder makes its supported documents searchable.</li>
+<li>Adding a URL fetches and indexes it immediately.</li>
+<li>The URL is not refreshed until explicitly requested.</li>
+<li>A relevant conversational topic produces a grounded suggestion without a direct question.</li>
+<li>A stale generation is cancelled when the conversation moves to a new topic.</li>
+<li>Every source-grounded suggestion can navigate back to its file location or URL.</li>
+<li>The app remains within the measured CPU and memory envelope on a 16 GB reference machine.</li>
+</ul>
+<h2 id="14-proposed-mvp-sequence">14. Proposed MVP sequence</h2>
+<h3 id="phase-1-feasibility-harness">Phase 1: feasibility harness</h3>
+<ul>
+<li>Capture WASAPI loopback and microphone audio.</li>
+<li>Run streaming <code>whisper.cpp</code> transcription.</li>
+<li>Measure latency, CPU, memory, and transcript stability on several Windows CPUs.</li>
+<li>Benchmark Gemma 4 E2B and E4B while ASR is active.</li>
+</ul>
+<p>This phase determines whether the default model profile meets the product's responsiveness target.</p>
+<h3 id="phase-2-local-retrieval-foundation">Phase 2: local retrieval foundation</h3>
+<ul>
+<li>Add the SQLite schema, FTS5, and <code>sqlite-vec</code>.</li>
+<li>Ingest supported local files.</li>
+<li>Add immediate URL ingestion and explicit refresh.</li>
+<li>Preserve citations and freshness metadata.</li>
+</ul>
+<h3 id="phase-3-conversation-intelligence">Phase 3: conversation intelligence</h3>
+<ul>
+<li>Stabilize streaming transcript segments.</li>
+<li>Maintain bounded conversation state.</li>
+<li>Implement proactive triggers, novelty controls, and retrieval fusion.</li>
+<li>Generate short grounded suggestions with citations.</li>
+</ul>
+<h3 id="phase-4-desktop-teleprompter">Phase 4: desktop teleprompter</h3>
+<ul>
+<li>Add the always-available Windows widget or overlay.</li>
+<li>Display live status, transcript health, and suggestion cards.</li>
+<li>Add user-selectable routes, cancellation, and session controls.</li>
+<li>Package the application and model installation flow.</li>
+</ul>
+<h2 id="15-decisions-intentionally-deferred">15. Decisions intentionally deferred</h2>
+<ul>
+<li>Exact overlay layout and card expansion behavior.</li>
+<li>Whether session transcripts persist by default or only when explicitly saved.</li>
+<li>The first supported CPU generation and minimum acceptable benchmark score.</li>
+<li>Whether multilingual transcription is required for the initial release.</li>
+<li>Which web-search provider, if any, should be added beyond user-supplied URLs.</li>
+<li>Authentication support for protected web pages or enterprise repositories.</li>
+<li>Whether future versions target macOS or Linux.</li>
+</ul>
+<h2 id="16-references">16. References</h2>
+<ul>
+<li><a href="https://learn.microsoft.com/en-us/windows/apps/">Microsoft Windows application development guidance</a></li>
+<li><a href="https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/">Windows App SDK</a></li>
+<li><a href="https://learn.microsoft.com/en-us/windows/win32/coreaudio/wasapi">Windows Audio Session API</a></li>
+<li><a href="https://github.com/ggml-org/whisper.cpp">whisper.cpp</a></li>
+<li><a href="https://huggingface.co/OpenASR/qwen3-asr-0.6b">Qwen3-ASR 0.6B OpenASR model card</a></li>
+<li><a href="https://ai.google.dev/gemma/docs">Gemma model overview</a></li>
+<li><a href="https://ai.google.dev/gemma/docs/core">Gemma 4 model overview</a></li>
+<li><a href="https://ai.google.dev/gemma/docs/core?authuser=50">Gemma 4 quantized model information</a></li>
+<li><a href="https://huggingface.co/Qwen/Qwen3.5-2B">Qwen3.5 2B model card</a></li>
+<li><a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a></li>
+<li><a href="https://ai.google.dev/gemma/docs/embeddinggemma">EmbeddingGemma</a></li>
+<li><a href="https://github.com/asg017/sqlite-vec">sqlite-vec</a></li>
+<li><a href="https://playwright.dev/dotnet/docs/library">Playwright for .NET</a></li>
+</ul>
+<h2 id="addendum-edge-intelligence-runtime-research">Addendum: Edge intelligence runtime research</h2>
+<p><strong>Research date:</strong> 29 August 2026<br />
+<strong>Scope:</strong> Kompact AI and comparable local inference options for the Windows x64, CPU-only, 16 GB MVP.</p>
+<h3 id="addendum-conclusion">Conclusion</h3>
+<p><strong>Kompact AI should be evaluated, but should not be a hard dependency of the MVP.</strong> It is Ziroh Labs' proprietary CPU-first inference platform, not the similarly named open-source context-compression proxy. Ziroh presents it as a runtime for text, speech, vision, multimodal models, RAG, and on-device copilots, with OpenAI-compatible clients and local deployment.</p>
+<p>The concept fits this product, but the public evidence is not yet sufficient for a redistributable consumer Windows application. Public material does not establish a Windows desktop support matrix, a 16 GB laptop memory profile, self-service runtime availability, a stable SDK contract, desktop redistribution terms, or incremental streaming-ASR behavior. Its download route currently leads to vendor contact rather than a public runtime package. These gaps should be treated as evaluation risks, not as evidence that the product cannot work.</p>
+<h3 id="addendum-runtime-comparison">Runtime comparison</h3>
+<table>
+<thead><tr><th>Option</th><th>Useful role</th><th>Main limitation for this MVP</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><td><strong>Kompact AI</strong></td><td>Potential CPU-accelerated generation, embeddings, or speech backend</td><td>Proprietary; public Windows client, licensing, streaming, memory, and benchmark details are incomplete</td><td>Vendor trial and benchmark only</td></tr>
+<tr><td><strong>llama.cpp</strong></td><td>Quantized local LLM generation through GGUF and an OpenAI-compatible server</td><td>Does not provide the product's orchestration or meeting pipeline</td><td>Default MVP generator</td></tr>
+<tr><td><strong>whisper.cpp</strong></td><td>Mature Windows CPU speech recognition</td><td>Its streaming example uses windowed retranscription and requires transcript stabilization</td><td>Initial MVP ASR</td></tr>
+<tr><td><strong>sherpa-onnx</strong></td><td>Native online ASR, VAD, punctuation, diarization, Windows x64, and C# packages</td><td>Meeting-audio accuracy must be measured against Whisper</td><td>Immediate ASR benchmark candidate</td></tr>
+<tr><td><strong>Microsoft Foundry Local</strong></td><td>Windows-native model acquisition, lifecycle, C# integration, and local APIs</td><td>SDK/API stability and CPU-only performance require validation</td><td>Near-term generation experiment</td></tr>
+<tr><td><strong>OpenVINO GenAI</strong></td><td>Optimized Whisper, embeddings, and text generation on Intel hardware</td><td>Hardware-specific artifacts and release complexity</td><td>Intel optimization path</td></tr>
+<tr><td><strong>ONNX Runtime</strong></td><td>VAD, embeddings, and potentially custom generative inference</td><td>More model conversion and lifecycle engineering than llama.cpp</td><td>Default VAD/embedding runtime</td></tr>
+<tr><td><strong>Ollama</strong></td><td>Convenient local model management during development</td><td>An extra resident service gives a shipped product less lifecycle control</td><td>Development adapter only</td></tr>
+</tbody>
+</table>
+<h3 id="addendum-architecture-adjustment">Architecture adjustment</h3>
+<p>The research reinforces the decision to avoid a single all-encompassing “AI platform” abstraction. The product should expose four narrow capabilities:</p>
+<pre><code>ITranscriber
+  AcceptAudio(frame) -&gt; partial/final transcript events
+
+IEmbedder
+  Embed(query/documents) -&gt; versioned vectors
+
+IRetriever
+  Search(query, filters) -&gt; cited evidence
+
+IGenerator
+  Stream(request, cancellation) -&gt; suggestion tokens and metadata</code></pre>
+<p>The internal contracts should include deadlines, priorities, cancellation reasons, source identifiers, timing, runtime/model versions, and privacy state. Provider-specific OpenAI-compatible APIs remain adapters rather than becoming the application's domain interface.</p>
+<h3 id="addendum-updated-recommendation">Updated recommendation</h3>
+<ul>
+<li>Keep the production baseline: C#/.NET orchestration, isolated workers, <code>whisper.cpp</code>, ONNX Runtime, SQLite FTS5 plus wrapped <code>sqlite-vec</code>, and <code>llama.cpp</code>.</li>
+<li>Benchmark <code>sherpa-onnx</code> against <code>whisper.cpp</code> using representative meeting recordings, measuring partial latency, finalization latency, word error rate, CPU use, and RAM.</li>
+<li>Create a Foundry Local generation spike after the first vertical slice, without coupling the product to its current API.</li>
+<li>Use OpenVINO only when hardware detection and benchmarks show a meaningful benefit on Intel devices.</li>
+<li>Ask Ziroh for a Kompact AI Windows trial, documentation, redistribution terms, telemetry details, and named-hardware benchmarks.</li>
+<li>Adopt Kompact for an individual capability only if it wins the end-to-end benchmark and satisfies offline, privacy, licensing, packaging, and cancellation requirements.</li>
+</ul>
+<h3 id="addendum-kompact-evaluation-gate">Kompact AI evaluation gate</h3>
+<p>Before building an adapter, obtain written answers covering Windows versions and CPU requirements; offline installation and activation; telemetry and network destinations; API versioning and cancellation; runtime and model redistribution; signed binaries and security response; streaming ASR semantics; embedding versioning; and memory use for simultaneous ASR, embeddings, and a small LLM.</p>
+<p>Benchmark it on the target computer while Meet, Zoom, or Teams is active. Measure end-to-end time from conversational cue to cited card, time to first token, tokens per second, cancellation latency, peak working set, CPU utilization, transcription delay, call quality, UI responsiveness, and thermal throttling.</p>
+<h3 id="addendum-sources">Addendum sources</h3>
+<ul>
+<li><a href="https://www.ziroh.com/">Kompact AI official product page</a></li>
+<li><a href="https://www.ziroh.com/faq">Kompact AI FAQ</a></li>
+<li><a href="https://www.ziroh.com/contact-us">Kompact AI download/contact route</a></li>
+<li><a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a></li>
+<li><a href="https://github.com/ggml-org/whisper.cpp">whisper.cpp</a></li>
+<li><a href="https://github.com/k2-fsa/sherpa-onnx">sherpa-onnx</a></li>
+<li><a href="https://learn.microsoft.com/en-us/azure/foundry-local/what-is-foundry-local">Microsoft Foundry Local</a></li>
+<li><a href="https://docs.openvino.ai/2026/_static/download/GenAI_Quick_Start_Guide.pdf">OpenVINO GenAI</a></li>
+<li><a href="https://github.com/microsoft/onnxruntime-genai">ONNX Runtime GenAI</a></li>
+</ul>
+</main></div>
+<footer>Standalone design proposal. All application inference is intended to remain local; fetching supplied web links necessarily uses the network.</footer>
+</body></html>
