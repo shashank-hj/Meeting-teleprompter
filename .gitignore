@@ -44,11 +44,14 @@ uploads/
 
 # Local model/runtime artifacts
 models/
+runtimes/
 *.gguf
 *.onnx
 *.bin
 
 # Build and packaging output
+bin/
+obj/
 build/
 dist/
 *.spec
@@ -61,3 +64,7 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Recoverable legacy prototype archive and local validation outputs
+.cleanup-backup/
+artifacts/
+*.msix

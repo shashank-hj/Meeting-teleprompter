@@ -1,0 +1,80 @@
+<Window x:Class="MeetingTeleprompter.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Meeting Teleprompter">
+    <Grid x:Name="Root" Background="#0D1117" RequestedTheme="Dark" Padding="24" RowSpacing="18">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Grid>
+            <StackPanel><TextBlock Text="MEETING TELEPROMPTER" FontSize="22" FontWeight="SemiBold"/>
+                <TextBlock Text="Stay present. Keep your knowledge close." Foreground="#8B949E" Margin="0,5,0,0"/></StackPanel>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="12">
+                <ToggleSwitch x:Name="PinSwitch" Header="Always on top" Toggled="Pin_Toggled"/>
+                <Button Content="Settings" Click="Settings_Click"/>
+            </StackPanel>
+        </Grid>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="10">
+            <Button x:Name="StartButton" Content="Start session" Click="StartButton_Click" Background="#246B55"/>
+            <Button x:Name="StopButton" Content="Stop" Click="StopButton_Click" IsEnabled="False"/>
+            <Button Content="Export transcript…" Click="ExportButton_Click"/>
+            <Button Content="Clear session" Click="ClearButton_Click"/>
+            <TextBlock Text="Ephemeral · inference stays on this device" VerticalAlignment="Center" Foreground="#8B949E" Margin="12,0,0,0"/>
+        </StackPanel>
+        <Grid Grid.Row="2" ColumnSpacing="16">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="270"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Border Background="#161B22" CornerRadius="12" Padding="16">
+                <Grid RowSpacing="10">
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                    <TextBlock Text="YOUR SOURCES" FontWeight="SemiBold"/>
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8">
+                        <Button x:Name="FolderButton" Content="Add folder" Click="Folder_Click"/>
+                        <Button x:Name="UrlButton" Content="Add URL" Click="Url_Click"/>
+                    </StackPanel>
+                    <TextBlock Grid.Row="2" Text="TXT · Markdown · PDF · DOCX · HTML" FontSize="11" Foreground="#8B949E"/>
+                    <ListView Grid.Row="3" x:Name="SourceList" SelectionMode="Single">
+                        <ListView.ItemTemplate><DataTemplate>
+                            <StackPanel Margin="0,8"><TextBlock Text="{Binding Title}" TextWrapping="Wrap"/>
+                                <TextBlock Text="{Binding Location}" FontSize="10" Foreground="#8B949E" TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding UpdatedAt}" FontSize="10" Foreground="#8B949E"/></StackPanel>
+                        </DataTemplate></ListView.ItemTemplate>
+                    </ListView>
+                    <StackPanel Grid.Row="4" Spacing="8">
+                        <Button x:Name="RefreshButton" Content="Refresh sources" Click="Refresh_Click"/>
+                        <Button x:Name="RemoveButton" Content="Remove selected source" Click="Remove_Click"/>
+                        <TextBlock Text="Web pages refresh only when requested. Indexing pauses during calls." TextWrapping="Wrap" FontSize="11" Foreground="#8B949E"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+            <Border Grid.Column="1" Background="#161B22" CornerRadius="12" Padding="16">
+                <Grid RowSpacing="10"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                    <StackPanel><TextBlock Text="LIVE TRANSCRIPT" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="PartialText" Text="Remote audio and your microphone appear separately." TextWrapping="Wrap" Foreground="#8B949E" FontSize="11" Margin="0,6,0,0"/></StackPanel>
+                    <ListView Grid.Row="1" x:Name="TranscriptList">
+                        <ListView.ItemTemplate><DataTemplate>
+                            <StackPanel Margin="0,8"><TextBlock Text="{Binding Header}" Foreground="#8B949E" FontSize="11"/>
+                                <TextBlock Text="{Binding Text}" TextWrapping="Wrap" Margin="0,5,0,0"/></StackPanel>
+                        </DataTemplate></ListView.ItemTemplate>
+                    </ListView>
+                </Grid>
+            </Border>
+            <Border Grid.Column="2" Background="#161B22" CornerRadius="12" Padding="16">
+                <Grid RowSpacing="10"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                    <StackPanel><TextBlock Text="SUGGESTED RESPONSES" FontWeight="SemiBold"/>
+                        <TextBlock Text="Relevant evidence appears as the conversation develops." TextWrapping="Wrap" Foreground="#8B949E" FontSize="11" Margin="0,6,0,0"/></StackPanel>
+                    <ScrollViewer Grid.Row="1"><StackPanel x:Name="SuggestionPanel" Spacing="14"/></ScrollViewer>
+                </Grid>
+            </Border>
+        </Grid>
+        <StackPanel Grid.Row="3" Spacing="10">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBox x:Name="SearchBox" Width="320" PlaceholderText="Search your indexed sources"/>
+                <Button Content="Search" Click="Search_Click"/>
+                <Button Content="Concise answer" Tag="concise" Click="Route_Click"/>
+                <Button Content="Evidence" Tag="evidence" Click="Route_Click"/>
+                <Button Content="Explain" Tag="explain" Click="Route_Click"/>
+                <Button Content="Check claim" Tag="check" Click="Route_Click"/>
+                <Button Content="Follow-up" Tag="follow-up" Click="Route_Click"/>
+                <Button Content="Cancel" Click="Cancel_Click"/>
+            </StackPanel>
+            <TextBlock x:Name="StatusText" Text="Ready · add sources and configure local runtimes to begin." TextWrapping="Wrap" Foreground="#93C5B5"/>
+        </StackPanel>
+    </Grid>
+</Window>
