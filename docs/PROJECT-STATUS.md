@@ -4,7 +4,11 @@ The native Windows MVP is implemented. This review completed missing ingestion, 
 
 The original proposal is a design and research record. Optional candidates, future experiments, and explicitly deferred decisions are distinguished below from the shipping baseline.
 
-Final verification: the release compiles successfully, all **81 acceptance checks pass**, and the actual worker extracted from the finished MSIX passes the same suite including installed Edge. The microphone-off WASAPI/Silero/ASR check passed. Package contents were verified to include the Windows worker/browser driver and exclude model weights and other-platform Node binaries. The unsigned package is `dist/MeetingTeleprompter.msix` (238,361,463 bytes).
+The implementation review passed 81 acceptance checks and verified its extracted MSIX worker, microphone-off WASAPI/Silero/ASR path, and package contents. The subsequent live-meeting UI update expands the suite to **84 checks**, adding cancellation, continued transcription/manual answering while auto assist is paused, and resumption for new speech. See [the live meeting walkthrough](LIVE-MEETINGS.md).
+
+The updated UI separates readiness, session status and assistance; adds a compact always-on-top meeting view, readable cards, elapsed time and transcript freshness; keeps manual/cancel/export actions available in compact view; and labels session ending **End & clear**. Actual-XAML render checks use fictional data and no audio capture. Interactive desktop tests and sustained call acceptance remain distinct.
+
+The rebuilt `dist/MeetingTeleprompter.msix` passed content verification and all 84 checks from its extracted worker. The unsigned UI-update package is 238,378,985 bytes. Current package details and the seven rendered layout scenarios are recorded in [VALIDATION.md](VALIDATION.md).
 
 ## Proposal coverage
 
@@ -69,7 +73,7 @@ Raw reports are local, ignored artifacts under `artifacts/profile-evaluation/202
 2. **Exact recommended generation candidates.** Gemma 4 E2B/E4B and Qwen3.5 2B have not been installed or compared here. The functioning installed selection remains Gemma 2 2B. Accepted licenses, compatible weights, and sufficient RAM are prerequisites to those comparisons.
 3. **Research addendum experiments.** sherpa-onnx, Qwen ASR, Foundry Local and OpenVINO comparisons remain experiments; no claim is made that adapters for these runtimes have been implemented or validated. Existing narrow interfaces keep those additions separate from the baseline.
 4. **Kompact gate.** Written Windows/offline/API/licensing/privacy/redistribution answers and a vendor runtime are still required before an adapter or benchmark. See [the evaluation checklist](RUNTIME-EVALUATION.md). No vendor was contacted.
-5. **Visual desktop verification.** The computer-use runtime failed to initialize in this session with `failed to write kernel assets: The system cannot find the path specified`. A clean XAML build does not replace visual testing of dialogs, card layout, and all interactions.
+5. **Interactive desktop verification.** The computer-use runtime still fails to initialize with `failed to write kernel assets: The system cannot find the path specified`. The app's isolated render-only QA covers actual XAML layouts with sample content and checks control bounds, but native title bars, popup dialogs and pointer/keyboard interaction remain open.
 6. **Publisher signing.** The generated MSIX is unsigned. A trusted certificate matching the manifest publisher is needed for installation/distribution. Certificate trust and installation were not changed.
 7. **Dependency audit.** NuGet's vulnerability feed was unreachable during package restore, including an escalated retry. Package creation can be checked, but that audit is not claimed as passed.
 

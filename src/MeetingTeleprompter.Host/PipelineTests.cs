@@ -77,7 +77,38 @@ internal static class PipelineTests
             await missingCapture.WaitAsync(TimeSpan.FromSeconds(5));
             Console.WriteLine("PASS: meeting questions without evidence show a needs-source answer");
         }
-        return 5;
+        var pauseAudio = new TestAudio();
+        var pauseGenerator = new TestGenerator();
+        await using (var pausable = new PipelineCoordinator(pauseAudio, new TestTranscriber(), new TestRetriever(), pauseGenerator))
+        {
+            var results = Channel.CreateUnbounded<Suggestion>();
+            var heardWhilePaused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var manualCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            pausable.SuggestionReady += result => results.Writer.TryWrite(result);
+            pausable.StableTranscript += entry => { if (entry.SegmentId == "1") heardWhilePaused.TrySetResult(); };
+            pausable.SuggestionCompleted += _ => { if (pauseGenerator.Calls >= 2) manualCompleted.TrySetResult(); };
+            var pausedCapture = pausable.StartAsync();
+            pauseAudio.Frames.Writer.TryWrite(new("remote", 0, DateTimeOffset.UtcNow, Encoding.UTF8.GetBytes("Orion budget needs approval")));
+            await pauseGenerator.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            pausable.ProactiveSuggestionsEnabled = false;
+            await pauseGenerator.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Console.WriteLine("PASS: pausing automatic assistance cancels its active generation");
+            pauseAudio.Frames.Writer.TryWrite(new("remote", 1, DateTimeOffset.UtcNow, Encoding.UTF8.GetBytes("What is the Orion budget?")));
+            await heardWhilePaused.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            if (pauseGenerator.Calls != 1) throw new Exception("Paused assistance generated automatically.");
+            pausable.RequestSuggestion("concise", "Who approves the budget?");
+            var manual = await results.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+            if (manual.Sources.Count != 1) throw new Exception("Manual assistance did not work while auto was paused.");
+            await manualCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Console.WriteLine("PASS: transcription and manual answers continue while automatic assistance is paused");
+            pausable.ProactiveSuggestionsEnabled = true;
+            pauseAudio.Frames.Writer.TryWrite(new("remote", 2, DateTimeOffset.UtcNow, Encoding.UTF8.GetBytes("When is the release approved?")));
+            await results.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+            Console.WriteLine("PASS: automatic assistance resumes for new speech");
+            pauseAudio.Frames.Writer.TryComplete();
+            await pausedCapture.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        return 8;
     }
     private sealed class TestAudio : IAudioSource
     {
@@ -120,6 +151,7 @@ internal static class PipelineTests
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Cancelled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _calls;
+        public int Calls => Volatile.Read(ref _calls);
         public async IAsyncEnumerable<string> StreamAsync(SuggestionRequest request, [EnumeratorCancellation] CancellationToken ct)
         {
             if (Interlocked.Increment(ref _calls) == 1)

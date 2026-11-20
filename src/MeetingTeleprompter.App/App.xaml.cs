@@ -18,6 +18,19 @@ public partial class App : Application
     protected override async void OnLaunched(LaunchActivatedEventArgs args)
     {
         var command = Environment.GetCommandLineArgs();
+        if (command.Length == 4 && command[1] == "--render-ui")
+        {
+            Directory.CreateDirectory(command[3]);
+            try
+            {
+                var preview = new MainWindow(command[2]);
+                _window = preview; preview.Activate();
+                await preview.RenderUiPreviewAsync(command[3]);
+                preview.Close();
+            }
+            catch (Exception error) { await File.WriteAllTextAsync(Path.Combine(command[3], "render-error.txt"), error.ToString()); }
+            Exit(); return;
+        }
         if (command.Length == 5 && command[1] == "--validate-audio")
         {
             await AudioValidation.RunAsync(command[2], command[3], command[4]);

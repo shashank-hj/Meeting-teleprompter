@@ -19,6 +19,24 @@ public sealed class PipelineCoordinator : IAsyncDisposable
     private bool _answeringQuestion;
     private string _proactiveTopic = "";
     private string _suggestionSegment = "";
+    private bool _proactiveEnabled = true;
+    public bool ProactiveSuggestionsEnabled
+    {
+        get { lock (_gate) return _proactiveEnabled; }
+        set
+        {
+            lock (_gate)
+            {
+                if (_proactiveEnabled == value) return;
+                _proactiveEnabled = value;
+                if (value) _triggers.Reset();
+                else if (!_manualActive) CancelSuggestion();
+                if (!_manualActive) StatusChanged?.Invoke(value
+                    ? "Ready · automatic assistance resumed for new speech."
+                    : "Ready · automatic assistance paused; transcription continues.");
+            }
+        }
+    }
     public event Action<TranscriptEvent>? PartialTranscript;
     public event Action<StableUtterance>? StableTranscript;
     public event Action<Suggestion>? SuggestionReady;
@@ -48,7 +66,9 @@ public sealed class PipelineCoordinator : IAsyncDisposable
                         lock (_gate)
                         {
                             _conversation.Add(stable);
-                            var decision = stable.IsCorrection ? new TriggerDecision(false, "correction", 0) : _triggers.Evaluate(stable, _conversation.Snapshot());
+                            var decision = stable.IsCorrection || !_proactiveEnabled
+                                ? new TriggerDecision(false, stable.IsCorrection ? "correction" : "paused", 0)
+                                : _triggers.Evaluate(stable, _conversation.Snapshot());
                             if (stable.IsCorrection && _suggestionSegment == stable.Channel + ":" + stable.SegmentId)
                                 CancelSuggestion();
                             // Cooldowns prevent replacement work; they must not keep obsolete work alive.

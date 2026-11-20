@@ -1,5 +1,17 @@
 # Validation history
 
+## Live meeting UI update — 20 November 2026
+
+The expanded core suite passes **84 checks**, including three new pause/resume scenarios: cancelling active automatic generation, continuing transcription and manual assistance while paused, and resuming automatic help for new speech. The release compiles without errors. The existing NU1900 audit-feed warning remains.
+
+The app's isolated `--render-ui` entry point also passed its layout assertions and rendered seven actual-XAML views: preparation, live workspace, compact meeting, compact draft/cancellation, expanded question input, source library and narrow window. The views were inspected and the compact composer was refined to leave more answer text visible on the laptop display. The check verifies important control bounds and always-on-top state. It uses explicitly labeled fictional content, starts no capture source or inference workers, and does not load models.
+
+Observed rendered sizes were 1284 × 701 for the workspace, 504 × 601 for meeting view and 384 × 701 for the narrow view. The final render report and images are under `artifacts/ui-live-review/a4578bcea2af4bbf80fa1ed89272af46/`.
+
+The updated MSIX was rebuilt and its extracted worker passed all 84 checks, including installed Edge. The package is 238,378,985 bytes; SHA-256: `C90F85451B03586AC04E5E09202F8F62A3855E4D80055978DB0E1CE6014C5C77`. Its content/hash/test receipt is `artifacts/msix-validation/latest-package-check.json`. The package remains unsigned.
+
+These are layout renders, not evidence of speech accuracy, sustained live-call performance or successful pointer/keyboard interaction. Native title bars and popup dialogs are outside the XAML image. The computer-use helper remains unavailable; those interactive checks are still open. [Live meeting instructions and controls](LIVE-MEETINGS.md) are provided in the repository and the app's **?** walkthrough.
+
 ## 20 November 2026 review
 
 The implementation review passed the acceptance suite, including actual installed-Edge rendering with blocked private/third-party requests, named-pipe inference transport, real folder changes/retries/renames/deletions, incremental FTS/vector behavior, parser upgrades, transcript corrections, stale-work cancellation, and low-memory evidence fallback. The final suite contains 81 checks including the browser check. Compilation completed without compiler errors; package restore's NU1900 feed warning is recorded below.
@@ -25,9 +37,9 @@ Current raw artifacts (local, ignored):
 - `artifacts/profile-evaluation/20261120-141822/comparison.json` and each profile's settings/results.
 - `artifacts/meeting-validation/completion-audio-results.json`.
 - `artifacts/msix-validation/20261120/package-check.json` and `device-benchmark.json` (the latter is the one-clip run before the final parser-version update).
-- `artifacts/msix-validation/latest-package-check.json` — final MSIX content/hash verification and all 81 checks run from its extracted worker. The final package SHA-256 is `95EA5A95D2DF029013E9A805AD2DEC4EC1E7D9DC0EA3CA38F9C8C13E7D43CC80`.
+- The pre-UI-update package passed 81 checks; its historical SHA-256 was `95EA5A95D2DF029013E9A805AD2DEC4EC1E7D9DC0EA3CA38F9C8C13E7D43CC80`. The current package and receipt are recorded in the live meeting UI section above.
 
-The final package is self-contained Windows x64 and excludes model weights. It still needs publisher signing for normal installation. Package restore reported NU1900 because the NuGet vulnerability feed could not be reached, including on an escalated retry; the dependency audit is therefore unverified. Desktop visual verification could not run because the computer-use helper failed to initialize after the session restart. Neither limitation is counted as a passing check.
+The package is self-contained Windows x64 and excludes model weights. It still needs publisher signing for normal installation. Package restore reported NU1900 because the NuGet vulnerability feed could not be reached, including on an escalated retry; the dependency audit is therefore unverified. Interactive desktop automation could not run because the computer-use helper failed to initialize after the session restart; the later render-only UI checks are described above. Neither the audit nor interactive automation is counted as a passing check.
 
 See [the requirement-by-requirement status and remaining acceptance gates](PROJECT-STATUS.md). The October report below is retained as historical evidence; its 1.40-second result is not presented as the current machine measurement.
 

@@ -39,7 +39,8 @@ public sealed partial class MainWindow : Window
     {
         if (settingsPath is not null) _settingsPath = Path.GetFullPath(settingsPath);
         InitializeComponent();
-        AppWindow.Resize(new Windows.Graphics.SizeInt32(1440, 860));
+        AppWindow.Resize(new Windows.Graphics.SizeInt32(1440, 920));
+        InitializeMeetingExperience();
         TranscriptList.ItemsSource = _transcript;
         SourceList.ItemsSource = _sources;
         Root.Loaded += async (_, _) => await Guard(async () =>
@@ -50,6 +51,7 @@ public sealed partial class MainWindow : Window
             _ingestor = new(_store, renderJavaScript: _settings.RenderJavaScriptPages);
             AnswerMode.SelectedIndex = _settings.AllowGeneralKnowledge ? 0 : 1;
             _loaded = true;
+            RefreshAudioReadiness();
             MicLevelLabel.Text = _settings.Microphone ? "Microphone" : "Microphone off";
             SetControls();
             await ReloadSources();
@@ -62,10 +64,12 @@ public sealed partial class MainWindow : Window
                     foreach (var folder in _settings.Folders.Where(Directory.Exists))
                         await _ingestor.ReconcileFolderAsync(folder, ct, Status);
                 });
+            _uiReady.TrySetResult();
         });
         Closed += async (_, _) =>
         {
             _closing = true; _lifetime.Cancel();
+            _meetingClock?.Stop();
             _runtimes.StopOwnedProcesses();
             foreach (var watcher in _watchers) watcher.Dispose();
             await StopSession();
@@ -85,6 +89,7 @@ public sealed partial class MainWindow : Window
         BusyIndicator.IsActive = _starting || _indexing || _asking || _answerBusy;
         CancelButton.Visibility = _asking || _answerBusy ? Visibility.Visible : Visibility.Collapsed;
         AnswerHelpText.Visibility = CancelButton.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+        ApplyMeetingLayout();
     });
     private async Task Guard(Func<Task> action)
     {
@@ -105,15 +110,16 @@ public sealed partial class MainWindow : Window
         RemoveButton.Visibility = SourceList.SelectedItem is SourceDocument ? Visibility.Visible : Visibility.Collapsed;
         AskButton.IsEnabled = MoreButton.IsEnabled = _loaded && !_indexing && !_starting && !_asking;
         BenchmarkButton.IsEnabled = _loaded && !_running && !_indexing && !_starting && !_asking;
-        StopButton.Content = _benchmarking ? "Cancel benchmark" : "Stop listening";
+        StopButton.Content = _benchmarking ? "Cancel benchmark" : _starting ? "Cancel start" : "End & clear";
         SessionLabel.Text = _benchmarking ? "Checking device · microphone off" : _starting ? "Starting local models…" : _running ? "Listening to the meeting" : "Not listening";
-        SessionDot.Fill = _running ? Brush(51, 136, 92) : Brush(160, 172, 160);
+        SessionDot.Fill = _running ? Brush(169, 222, 181) : Brush(138, 165, 155);
         TranscriptEmptyTitle.Text = _running ? "Listening for speech…" : "Start listening to see the conversation.";
         TranscriptChannelLabel.Text = _settings.Microphone ? "System audio + microphone" : "System audio only";
         ExportButton.Visibility = _transcript.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         BusyIndicator.IsActive = _starting || _indexing || _asking || _answerBusy;
         CancelButton.Visibility = _asking || _answerBusy ? Visibility.Visible : Visibility.Collapsed;
         AnswerHelpText.Visibility = CancelButton.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+        RefreshMeetingPresentation();
     }
     private async void StartButton_Click(object sender, RoutedEventArgs e) => await Guard(async () =>
     {
@@ -136,6 +142,8 @@ public sealed partial class MainWindow : Window
             if (!File.Exists(worker)) throw new FileNotFoundException("Worker executable is missing. Rebuild the application.", worker);
             await _indexGate.WaitAsync(startup.Token);
             _running = true;
+            _sessionStartedAt = DateTimeOffset.UtcNow;
+            _lastTranscriptAt = null;
             _indexGate.Release();
             _transcript.Clear(); ClearDraft(); _draftRevision = 0; SuggestionPanel.Children.Clear();
             var version = ++_sessionVersion;
@@ -149,19 +157,24 @@ public sealed partial class MainWindow : Window
                 var meter = channel == "local" ? MicLevel : RemoteLevel;
                 meter.Value = level;
                 if (channel == "local") MicLevelLabel.Text = speaking ? "You · speech" : "Microphone";
-                else RemoteLevelLabel.Text = speaking ? "Meeting · speech" : "System audio";
+                else RemoteLevelLabel.Text = speaking ? "Call · speech" : "Call audio";
             });
             _pipeline = new(audio, new PipeTranscriber(_asrWorker, _settings.WhisperEndpoint, _settings.SpeechVocabulary, _settings.WhisperBeamSize), Retriever(),
-                new BudgetedGenerator(new PipeGenerator(_generatorWorker, _settings.GeneratorEndpoint), _runtimes, _settings)) { AllowGeneralKnowledge = AnswerMode.SelectedIndex == 0 };
+                new BudgetedGenerator(new PipeGenerator(_generatorWorker, _settings.GeneratorEndpoint), _runtimes, _settings))
+                { AllowGeneralKnowledge = AnswerMode.SelectedIndex == 0, ProactiveSuggestionsEnabled = AutomaticSwitch.IsOn };
             _pipeline.StatusChanged += Status;
             _pipeline.PartialTranscript += entry => DispatcherQueue.TryEnqueue(() =>
             {
-                if (version == _sessionVersion && _running) PartialText.Text = entry.Kind == TranscriptKind.Partial ? entry.Channel + " · " + entry.Text : "";
+                if (version == _sessionVersion && _running)
+                {
+                    PartialText.Text = entry.Kind == TranscriptKind.Partial ? (entry.Channel == "local" ? "You" : "Call") + " · " + entry.Text : "";
+                    _lastTranscriptAt = DateTimeOffset.UtcNow; UpdateMeetingClock();
+                }
             });
             _pipeline.StableTranscript += entry => DispatcherQueue.TryEnqueue(() =>
             {
                 if (version != _sessionVersion || !_running) return;
-                var item = new TranscriptItem(entry, $"{entry.Start:mm\\:ss} · {(entry.Channel == "local" ? "You" : "Remote")}" + (entry.IsCorrection ? " · corrected" : ""), entry.Text);
+                var item = new TranscriptItem(entry, $"{entry.Start:mm\\:ss} · {(entry.Channel == "local" ? "You" : "Call")}" + (entry.IsCorrection ? " · corrected" : ""), entry.Text);
                 var old = _transcript.FirstOrDefault(x => x.Entry.Channel == entry.Channel && x.Entry.SegmentId == entry.SegmentId);
                 if (entry.IsCorrection && old is not null)
                 {
@@ -175,6 +188,7 @@ public sealed partial class MainWindow : Window
                 ExportButton.Visibility = Visibility.Visible;
                 while (_transcript.Count > 600) _transcript.RemoveAt(0);
                 TranscriptList.ScrollIntoView(_transcript.Last());
+                UpdateQuickActions();
             });
             _pipeline.SuggestionReady += suggestion => DispatcherQueue.TryEnqueue(() =>
             {
@@ -238,6 +252,7 @@ public sealed partial class MainWindow : Window
         _startCancellation?.Cancel();
         _askCancellation?.Cancel();
         _running = false; _answerBusy = false; _sessionVersion++;
+        _sessionStartedAt = _lastTranscriptAt = null;
         var pipeline = _pipeline; _pipeline = null;
         if (pipeline is not null) await pipeline.DisposeAsync();
         if (_asrWorker is not null) { await _asrWorker.DisposeAsync(); _asrWorker = null; }
@@ -261,7 +276,7 @@ public sealed partial class MainWindow : Window
             ClearDraft();
             _draftRevision = revision;
             _draftLabel = new TextBlock { FontSize = 10, CharacterSpacing = 90, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = Brush(151, 103, 40) };
-            _draftText = new TextBlock { TextWrapping = TextWrapping.Wrap, FontSize = 17, Foreground = Brush(39, 58, 43), IsTextSelectionEnabled = true };
+            _draftText = new TextBlock { TextWrapping = TextWrapping.Wrap, FontSize = 21, LineHeight = 30, Foreground = Brush(39, 58, 43), IsTextSelectionEnabled = true };
             _draftPanel = new StackPanel { Spacing = 10, Padding = new Thickness(16), Background = Brush(255, 249, 234) };
             _draftPanel.Children.Add(_draftLabel);
             _draftPanel.Children.Add(new TextBlock { Text = question, FontSize = 13, TextWrapping = TextWrapping.Wrap, Foreground = Brush(100, 111, 94) });
@@ -290,11 +305,12 @@ public sealed partial class MainWindow : Window
         var general = suggestion.Basis == AnswerBasis.GeneralKnowledge;
         var needsSource = suggestion.Basis == AnswerBasis.NeedsSource;
         var limited = suggestion.Basis == AnswerBasis.ResourceLimited;
+        var advisory = general || needsSource || limited;
         var labelText = general ? "GENERAL KNOWLEDGE" : limited ? "DEVICE BUSY" : needsSource ? "MORE EVIDENCE NEEDED" : suggestion.IsGeneratedAssistance ? "FROM YOUR SOURCES" : "SOURCE EVIDENCE";
-        panel.Children.Add(new TextBlock { Text = labelText + "  ·  " + suggestion.CreatedAt.ToLocalTime().ToString("HH:mm"), FontSize = 10, CharacterSpacing = 90, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = general || needsSource ? Brush(151, 103, 40) : Brush(52, 116, 77), TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(new TextBlock { Text = labelText + "  ·  " + suggestion.CreatedAt.ToLocalTime().ToString("HH:mm"), FontSize = 10, CharacterSpacing = 90, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = advisory ? Brush(151, 103, 40) : Brush(52, 116, 77), TextWrapping = TextWrapping.Wrap });
         if (suggestion.Question.Length > 0) panel.Children.Add(new TextBlock { Text = suggestion.Question, FontSize = 13, Foreground = Brush(119, 132, 113), TextWrapping = TextWrapping.Wrap, MaxLines = 3 });
-        panel.Children.Add(new TextBlock { Text = suggestion.Text, FontSize = 19, LineHeight = 29, Foreground = Brush(39, 58, 43), TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
-        panel.Children.Add(new TextBlock { Text = general ? "Generated assistance. Not verified by your documents. No web lookup was made." : needsSource ? "Add a source in the sidebar, then ask again." : suggestion.IsGeneratedAssistance ? "Generated assistance. Check the linked passages before relying on this response." : "Retrieved source passages. Open a citation to review its location.", FontSize = 11, Foreground = Brush(127, 134, 116), TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(new TextBlock { Text = suggestion.Text, FontSize = 22, LineHeight = 32, Foreground = Brush(32, 56, 42), TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
+        panel.Children.Add(new TextBlock { Text = general ? "Generated assistance. Not verified by your documents. No web lookup was made." : limited ? "Local drafting is unavailable right now. Add sources or use Evidence for retrieved passages." : needsSource ? "Add a source in the sidebar, then ask again." : suggestion.IsGeneratedAssistance ? "Generated assistance. Check the linked passages before relying on this response." : "Retrieved source passages. Open a citation to review its location.", FontSize = 11, Foreground = Brush(127, 134, 116), TextWrapping = TextWrapping.Wrap });
         for (var i = 0; i < suggestion.Sources.Count; i++)
         {
             var source = suggestion.Sources[i];
@@ -307,7 +323,7 @@ public sealed partial class MainWindow : Window
             {
                 if (passage is not null)
                 {
-                    var content = new StackPanel { Spacing = 12, MinWidth = 400, MaxWidth = 600 };
+                    var content = new StackPanel { Spacing = 12, Width = Math.Max(220, Math.Min(520, Root.ActualWidth - 110)) };
                     content.Children.Add(new TextBlock { Text = label, TextWrapping = TextWrapping.Wrap, FontSize = 12 });
                     content.Children.Add(new TextBlock { Text = passage, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
                     content.Children.Add(new TextBlock { Text = source.CanonicalLocation, TextWrapping = TextWrapping.Wrap, FontSize = 11, IsTextSelectionEnabled = true });
@@ -327,7 +343,8 @@ public sealed partial class MainWindow : Window
             });
             panel.Children.Add(button);
         }
-        var copy = new Button { Content = "Copy answer", FontSize = 11, Padding = new Thickness(10, 5, 10, 5), Background = Brush(247, 248, 244), CornerRadius = new CornerRadius(6) };
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        var copy = new Button { Content = "Copy", FontSize = 12, Padding = new Thickness(12, 7, 12, 7), Background = Brush(240, 245, 239), CornerRadius = new CornerRadius(8) };
         copy.Click += (_, _) =>
         {
             var data = new Windows.ApplicationModel.DataTransfer.DataPackage();
@@ -336,8 +353,8 @@ public sealed partial class MainWindow : Window
             Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(data);
             Status("Answer copied, including its source label.");
         };
-        panel.Children.Add(copy);
-        var routes = new Button { Content = "Explore this answer", FontSize = 11, Padding = new Thickness(10, 5, 10, 5), CornerRadius = new CornerRadius(6) };
+        actions.Children.Add(copy);
+        var routes = new Button { Content = "Explore answer", FontSize = 12, Padding = new Thickness(12, 7, 12, 7), CornerRadius = new CornerRadius(8) };
         var menu = new MenuFlyout();
         foreach (var (title, route) in new[] { ("Concise answer", "concise"), ("Supporting evidence", "evidence"), ("Explain simply", "explain"), ("Check this claim", "check"), ("Suggest a follow-up", "follow-up") })
         {
@@ -346,8 +363,9 @@ public sealed partial class MainWindow : Window
             menu.Items.Add(item);
         }
         routes.Flyout = menu;
-        panel.Children.Add(routes);
-        SuggestionPanel.Children.Insert(0, new Border { Child = panel, Padding = new Thickness(22), CornerRadius = new CornerRadius(14), Background = Brush(255, 255, 255), BorderBrush = general || needsSource ? Brush(231, 211, 174) : Brush(215, 227, 210), BorderThickness = new Thickness(1) });
+        actions.Children.Add(routes);
+        panel.Children.Add(actions);
+        SuggestionPanel.Children.Insert(0, new Border { Child = panel, Padding = new Thickness(22), CornerRadius = new CornerRadius(14), Background = Brush(255, 255, 255), BorderBrush = advisory ? Brush(231, 211, 174) : Brush(215, 227, 210), BorderThickness = new Thickness(1) });
         while (SuggestionPanel.Children.Count > 15) SuggestionPanel.Children.RemoveAt(15);
         AnswersScroll.ChangeView(null, 0, null);
     }
@@ -477,6 +495,8 @@ public sealed partial class MainWindow : Window
     {
         if (!_loaded || _asking || _starting || _indexing) return;
         var question = (selectedQuestion ?? SearchBox.Text).Trim();
+        if ((_pipeline is not null || question.Length > 0) && (_meetingView || Root.ActualWidth < 760))
+        { _compactComposerExpanded = false; ApplyMeetingLayout(); }
         if (_pipeline is not null) { _pipeline.RequestSuggestion(route, question.Length == 0 ? null : question); return; }
         if (question.Length == 0) { Status("Type a question, or start a session to use the conversation."); return; }
         _asking = true; SetControls();
@@ -519,14 +539,12 @@ public sealed partial class MainWindow : Window
     }
     private void Root_SizeChanged(object sender, SizeChangedEventArgs e)
     {
-        if (SourcesPane is null || TranscriptColumn is null) return;
-        SetSourceVisibility(_sourcesVisible && e.NewSize.Width >= 1180);
-        TranscriptColumn.Width = new GridLength(e.NewSize.Width < 1100 ? 260 : 310);
+        ApplyMeetingLayout();
     }
     private void Sources_Click(object sender, RoutedEventArgs e)
     {
         _sourcesVisible = SourcesPane.Visibility != Visibility.Visible;
-        SetSourceVisibility(_sourcesVisible);
+        ApplyMeetingLayout();
     }
     private void SetSourceVisibility(bool visible)
     {
@@ -604,7 +622,7 @@ public sealed partial class MainWindow : Window
         var embeddingModel = new TextBox { Header = "EmbeddingGemma GGUF path", Text = _settings.EmbeddingModelPath };
         var sileroModel = new TextBox { Header = "Silero VAD ONNX path (empty = basic energy detector)", Text = _settings.SileroModelPath };
         var sqliteVec = new TextBox { Header = "sqlite-vec vec0.dll path (empty = managed cosine)", Text = _settings.SqliteVecPath };
-        var panel = new StackPanel { Spacing = 10, MinWidth = 440 };
+        var panel = new StackPanel { Spacing = 10, Width = Math.Max(220, Math.Min(440, Root.ActualWidth - 110)) };
         using var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
         ComboBox Devices(NAudio.CoreAudioApi.DataFlow flow, string header, string? selected)
         {
@@ -621,7 +639,7 @@ public sealed partial class MainWindow : Window
         var advanced = new StackPanel { Spacing = 10 };
         foreach (var control in new UIElement[] { whisper, generator, embedding, whisperExe, whisperModel, llamaExe, generatorModel, embeddingModel, sileroModel, sqliteVec, semantic, javaScript, conserve, model, data }) advanced.Children.Add(control);
         panel.Children.Add(new Expander { Header = "Advanced · local models and index", Content = advanced, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch });
-        if (await Dialog("Make it sound like you", new ScrollViewer { Content = panel, MaxHeight = 550, Padding = new Thickness(0, 0, 12, 0) }, "Save settings").ShowAsync() != ContentDialogResult.Primary) return;
+        if (await Dialog("Audio & local assistance", new ScrollViewer { Content = panel, MaxHeight = Math.Max(200, Math.Min(550, Root.ActualHeight - 150)), Padding = new Thickness(0, 0, 12, 0) }, "Save settings").ShowAsync() != ContentDialogResult.Primary) return;
         RuntimeSettings.LocalUri(whisper.Text); RuntimeSettings.LocalUri(generator.Text); RuntimeSettings.LocalUri(embedding.Text);
         var directory = Path.GetFullPath(data.Text);
         _settings = _settings with { WhisperEndpoint = whisper.Text, GeneratorEndpoint = generator.Text, EmbeddingEndpoint = embedding.Text, SemanticSearch = semantic.IsChecked == true, Microphone = mic.IsChecked == true, DataDirectory = directory, EmbeddingModel = model.Text, OutputDeviceId = ((DeviceOption)outputDevice.SelectedItem).Id, MicrophoneDeviceId = ((DeviceOption)inputDevice.SelectedItem).Id };
@@ -629,6 +647,7 @@ public sealed partial class MainWindow : Window
         _settings = _settings with { VoiceThreshold = threshold.Value, EndSilenceMs = (int)pause.Value, SpeechVocabulary = vocabulary.Text.Trim(), WhisperBeamSize = decoder.SelectedIndex == 1 ? 3 : 1 };
         _settings = _settings with { RenderJavaScriptPages = javaScript.IsChecked == true };
         _settings = _settings with { ConserveMemory = conserve.IsChecked == true };
+        RefreshAudioReadiness();
         MicLevelLabel.Text = _settings.Microphone ? "Microphone" : "Microphone off";
         await _runtimes.DisposeAsync();
         _store.Dispose(); _store = new(Path.Combine(directory, "sources.db"), _settings.SqliteVecPath); _ingestor = new(_store, renderJavaScript: _settings.RenderJavaScriptPages);

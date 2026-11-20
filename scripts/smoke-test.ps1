@@ -7,7 +7,7 @@ $root = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindo
 if (-not $root) { throw 'Desktop window was not created.' }
 $controls = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
 $names = @($controls | ForEach-Object { $_.Current.Name })
-foreach ($expected in @('Start session','Live transcript','Your conversation copilot','Settings','Answer policy')) {
+foreach ($expected in @('Start session','Live transcript','Meeting assistance','Settings','Answer policy','Auto assist','Meeting view')) {
     if ($names -notcontains $expected) { throw "Missing UI element: $expected" }
     Write-Host "PASS: UI element $expected"
 }
@@ -25,8 +25,13 @@ if ($CheckSearch) {
     $searchBox = $controls | Where-Object { $_.Current.AutomationId -eq 'SearchBox' } | Select-Object -First 1
     if (-not $searchBox) { throw 'Search input is missing.' }
     $searchBox.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('How should we prepare for a meeting?')
-    $searchButton = $controls | Where-Object { $_.Current.Name -eq 'Search' -and $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button } | Select-Object -First 1
-    $searchButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $options = $controls | Where-Object { $_.Current.Name -eq 'Options' -and $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button } | Select-Object -First 1
+    $options.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Start-Sleep -Milliseconds 250
+    $menuControls = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    $evidence = $menuControls | Where-Object { $_.Current.Name -eq 'Find source evidence' } | Select-Object -First 1
+    if (-not $evidence) { throw 'The source-evidence route is missing.' }
+    $evidence.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
     $searchDeadline = [DateTime]::UtcNow.AddSeconds(45)
     $found = $false
     while ([DateTime]::UtcNow -lt $searchDeadline) {
