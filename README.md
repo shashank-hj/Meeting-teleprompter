@@ -2,7 +2,9 @@
 
 Native Windows desktop implementation of [the design proposal](local-meeting-teleprompter-proposal.html), using C#/.NET 10 and WinUI 3 / Windows App SDK 2.4. The Python web prototype has been retired.
 
-Current review: **native MVP implemented; release acceptance remains open**. See [proposal coverage, completed changes, current measurements, and remaining gates](docs/PROJECT-STATUS.md). The regression suite includes 81 checks with the optional installed-Edge check.
+Current review: **native MVP implemented; release acceptance remains open**. See [proposal coverage, completed changes, current measurements, and remaining gates](docs/PROJECT-STATUS.md). The regression suite includes 84 checks with the optional installed-Edge check.
+
+The desktop now includes a compact **Meeting view**, audio/readiness guidance, a session clock, **Auto assist** pause without stopping transcription, and quick **Answer latest** / **Evidence** actions. See [how it works in live meetings](docs/LIVE-MEETINGS.md). The **?** button contains the same practical walkthrough in the app.
 
 ## Build and open
 
@@ -61,9 +63,10 @@ Without optional assets, keyword search and a basic energy-based voice detector 
 1. Add folders containing TXT, Markdown, HTML, text PDFs, or DOCX. The included `knowledge_base` folder is available as starter material.
 2. Add public web URLs to fetch and index them immediately. Their stored copies change only when you add the URL again or click **Refresh sources**.
 3. Select the meeting output device and microphone in Settings. Windows microphone privacy settings must allow desktop apps.
-4. Start a session. WASAPI captures the selected output device's system audio, including other applications playing through it. The microphone appears as “You”; output audio appears as “Remote”. Remote speakers are not individually identified.
+4. Start a session. WASAPI captures the selected output device's system audio, including other applications playing through it. The microphone appears as “You”; output audio appears as “Call”. Remote speakers are not individually identified.
 5. Suggestions appear on topic/question/claim triggers. Meeting and typed questions stream labeled drafts, followed by the checked answer or a request for evidence. Use concise answer, evidence, explain, check claim, or follow-up routes, including on individual cards. Citation buttons show the cited passage and its heading/page/chunk, fetch time, and original location; choose **Open original** to navigate there.
-6. Export before stopping if you want a transcript file. **Stop**, **Clear session**, and closing the app clear the in-memory transcript and cards.
+6. Choose **Meeting view** for a compact window above the call. Pause **Auto assist** to read without automatic replacements; transcription and manual requests continue. Use **Ask a question**, **Answer latest**, or **Evidence** in that view.
+7. Export before ending if you want a transcript file. **End & clear** and closing the app clear the in-memory transcript and cards. Export is available from **…** even with the transcript pane hidden.
 
 The UI retains the latest 600 final utterances and 15 cards; exports contain that retained transcript. Always-on-top is optional. Audio device loss stops the session with an error; select the new device and restart.
 
@@ -89,7 +92,9 @@ Settings and the default index live in `%LOCALAPPDATA%\MeetingTeleprompter`. The
 .\scripts\build.ps1
 ```
 
-This builds all projects and runs the executable acceptance checks for transcript revisions/overlap, address safety, chunking, ingestion, incremental indexes, parser upgrades, embedding/cascade behavior, retrieval fusion, proactive triggers, scheduling/cancellation, filesystem watching, resource fallback and actual named-pipe transport/failure/restart. Add `--with-browser` to the host's `--self-test` command to include installed Edge (81 checks total). Native model output is not simulated in the product; automated transport tests use a deterministic HTTP fixture.
+This builds all projects and runs the executable acceptance checks for transcript revisions/overlap, address safety, chunking, ingestion, incremental indexes, parser upgrades, embedding/cascade behavior, retrieval fusion, proactive triggers, auto-assist pause/resume, scheduling/cancellation, filesystem watching, resource fallback and actual named-pipe transport/failure/restart. Add `--with-browser` to the host's `--self-test` command to include installed Edge (84 checks total). Native model output is not simulated in the product; automated transport tests use a deterministic HTTP fixture.
+
+Run `scripts/render-ui.ps1` for an isolated sample-content render of the actual XAML layouts, with audio capture disabled. It checks key controls at multiple window sizes and writes preview images under `artifacts/ui-live-review`. It does not replace interactive desktop or live-call testing.
 
 For repeatable comparisons of the installed base speech profiles and optional small model, run `scripts/evaluate-profiles.ps1 -IncludeSmallSpeechModel`. Its separate indexes and reports stay under `artifacts/profile-evaluation`; it does not change app settings. Extra settings files can compare other installed native-model candidates. The current comparison and unvalidated runtime experiments are documented in [PROJECT-STATUS.md](docs/PROJECT-STATUS.md).
 
