@@ -6,7 +6,14 @@ public partial class App : Application
 {
     private Window? _window;
 
-    public App() => InitializeComponent();
+    public App()
+    {
+        InitializeComponent();
+        var command = Environment.GetCommandLineArgs();
+        // Explicit test-only startup diagnostics, never routine transcript logging.
+        if (command.Length == 4 && command[1] == "--ui-validation")
+            UnhandledException += (_, e) => File.WriteAllText(command[3], e.Exception.ToString());
+    }
 
     protected override async void OnLaunched(LaunchActivatedEventArgs args)
     {
@@ -17,7 +24,7 @@ public partial class App : Application
             Exit();
             return;
         }
-        _window = new MainWindow();
+        _window = new MainWindow(command.Length == 4 && command[1] == "--ui-validation" ? command[2] : null);
         _window.Activate();
     }
 }

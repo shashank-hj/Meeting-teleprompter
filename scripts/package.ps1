@@ -2,11 +2,12 @@ param([string]$CertificatePath)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $staging = Join-Path $projectRoot ('dist/package-' + [Guid]::NewGuid().ToString('N'))
+$packageBuild = (Join-Path $projectRoot 'artifacts/package-build/')
 New-Item -ItemType Directory -Path $staging | Out-Null
-dotnet publish (Join-Path $projectRoot 'src/MeetingTeleprompter.App/MeetingTeleprompter.App.csproj') -c Release -r win-x64 --self-contained true -o $staging
+dotnet publish (Join-Path $projectRoot 'src/MeetingTeleprompter.App/MeetingTeleprompter.App.csproj') -c Release -r win-x64 --self-contained true -p:BaseOutputPath=$packageBuild -o $staging
 if ($LASTEXITCODE -ne 0) { throw 'Publish failed.' }
 $workerDirectory = Join-Path $staging 'workers'
-dotnet publish (Join-Path $projectRoot 'src/MeetingTeleprompter.Host/MeetingTeleprompter.Host.csproj') -c Release -r win-x64 --self-contained true -o $workerDirectory
+dotnet publish (Join-Path $projectRoot 'src/MeetingTeleprompter.Host/MeetingTeleprompter.Host.csproj') -c Release -r win-x64 --self-contained true -p:BaseOutputPath=$packageBuild -o $workerDirectory
 if ($LASTEXITCODE -ne 0) { throw 'Worker publish failed.' }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging/AppxManifest.xml') -Destination (Join-Path $staging 'AppxManifest.xml')
 $assets = Join-Path $staging 'Assets'

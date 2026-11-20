@@ -17,6 +17,7 @@ public enum WorkPriority
 }
 
 public enum TranscriptKind { Partial, Final }
+public enum AnswerBasis { Sources, GeneralKnowledge, NeedsSource, ResourceLimited }
 
 public sealed record AudioFrame(
     string Channel,
@@ -42,7 +43,8 @@ public sealed record StableUtterance(
     TimeSpan Start,
     TimeSpan End,
     double Confidence,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    bool IsCorrection = false);
 
 public sealed record SourceReference(
     string Id,
@@ -52,7 +54,8 @@ public sealed record SourceReference(
     DateTimeOffset? FetchedAt,
     string ContentHash,
     int? Page,
-    int ChunkIndex);
+    int ChunkIndex,
+    string Heading = "");
 
 public sealed record EvidenceChunk(
     string Id,
@@ -76,7 +79,8 @@ public sealed record SuggestionRequest(
     string Route,
     ConversationSnapshot Conversation,
     IReadOnlyList<EvidenceChunk> Evidence,
-    CancellationToken CancellationToken);
+    CancellationToken CancellationToken,
+    AnswerBasis Basis = AnswerBasis.Sources);
 
 public sealed record Suggestion(
     string Id,
@@ -84,7 +88,10 @@ public sealed record Suggestion(
     string Route,
     bool IsGeneratedAssistance,
     IReadOnlyList<SourceReference> Sources,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    AnswerBasis Basis = AnswerBasis.Sources,
+    string Question = "",
+    IReadOnlyList<EvidenceChunk>? Evidence = null);
 
 public interface ITranscriber
 {

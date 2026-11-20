@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- This product ships Windows x64; do not copy other platforms' Node binaries. -->
+    <PlaywrightPlatform>win-x64</PlaywrightPlatform>
+  </PropertyGroup>
+</Project>

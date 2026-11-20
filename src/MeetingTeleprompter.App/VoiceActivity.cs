@@ -5,16 +5,19 @@ namespace MeetingTeleprompter.App;
 
 public interface IVoiceActivity : IDisposable
 {
-    bool IsSpeech(float[] samples, int count);
+    float Probability(float[] samples, int count);
 }
 
 public sealed class EnergyVoiceActivity : IVoiceActivity
 {
-    public bool IsSpeech(float[] samples, int count)
+    private double _noiseFloor = .002;
+    public float Probability(float[] samples, int count)
     {
         double energy = 0;
         for (var i = 0; i < count; i++) energy += samples[i] * samples[i];
-        return Math.Sqrt(energy / Math.Max(1, count)) > .008;
+        var rms = Math.Sqrt(energy / Math.Max(1, count));
+        if (rms < _noiseFloor * 2) _noiseFloor = .98 * _noiseFloor + .02 * rms;
+        return (float)Math.Clamp((rms - _noiseFloor) / Math.Max(.006, _noiseFloor * 3), 0, 1);
     }
     public void Dispose() { }
 }
@@ -26,16 +29,16 @@ public sealed class SileroVoiceActivity : IVoiceActivity
     private readonly Queue<float> _pending = new();
     private float[] _state = new float[256];
     private readonly float[] _context = new float[64];
-    private bool _last;
+    private float _last;
     public SileroVoiceActivity(string path)
     {
         using var options = new SessionOptions { IntraOpNumThreads = 1, InterOpNumThreads = 1 };
         _session = new(path, options);
     }
-    public bool IsSpeech(float[] samples, int count)
+    public float Probability(float[] samples, int count)
     {
         for (var i = 0; i < count; i++) _pending.Enqueue(samples[i]);
-        var speech = false;
+        var speech = 0f;
         var evaluated = false;
         while (_pending.Count >= 512)
         {
@@ -48,10 +51,10 @@ public sealed class SileroVoiceActivity : IVoiceActivity
                 NamedOnnxValue.CreateFromTensor("state", new DenseTensor<float>(_state, new[] { 2, 1, 128 })),
                 NamedOnnxValue.CreateFromTensor("sr", new DenseTensor<long>(new long[] { 16000 }, Array.Empty<int>()))
             });
-            _last = result.First(x => x.Name == "output").AsTensor<float>().First() >= .5f;
+            _last = result.First(x => x.Name == "output").AsTensor<float>().First();
             _state = result.First(x => x.Name == "stateN").AsTensor<float>().ToArray();
             Array.Copy(input, 512, _context, 0, 64);
-            speech |= _last; evaluated = true;
+            speech = Math.Max(speech, _last); evaluated = true;
         }
         return evaluated ? speech : _last;
     }

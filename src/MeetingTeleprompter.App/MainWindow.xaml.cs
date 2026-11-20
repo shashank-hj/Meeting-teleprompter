@@ -16,6 +16,7 @@ public sealed partial class MainWindow : Window
     private readonly ObservableCollection<SourceDocument> _sources = [];
     private readonly List<FileSourceWatcher> _watchers = [];
     private readonly SemaphoreSlim _indexGate = new(1);
+    private readonly SemaphoreSlim _settingsGate = new(1);
     private readonly NativeRuntimeManager _runtimes = new();
     private readonly CancellationTokenSource _lifetime = new();
     private readonly string _settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MeetingTeleprompter", "settings.json");
@@ -24,11 +25,19 @@ public sealed partial class MainWindow : Window
     private DocumentIngestor _ingestor = null!;
     private PipelineCoordinator? _pipeline;
     private PipeInferenceClient? _asrWorker, _generatorWorker;
-    private bool _running, _closing, _indexing;
+    private bool _running, _closing, _indexing, _starting, _benchmarking;
+    private CancellationTokenSource? _startCancellation;
     private int _sessionVersion;
+    private CancellationTokenSource? _askCancellation;
+    private bool _loaded, _asking, _sourcesVisible, _answerBusy;
+    private bool _semanticAvailable;
+    private StackPanel? _draftPanel;
+    private TextBlock? _draftLabel, _draftText;
+    private long _draftRevision;
 
-    public MainWindow()
+    public MainWindow(string? settingsPath = null)
     {
+        if (settingsPath is not null) _settingsPath = Path.GetFullPath(settingsPath);
         InitializeComponent();
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1440, 860));
         TranscriptList.ItemsSource = _transcript;
@@ -38,21 +47,45 @@ public sealed partial class MainWindow : Window
             if (File.Exists(_settingsPath))
                 _settings = JsonSerializer.Deserialize<RuntimeSettings>(await File.ReadAllTextAsync(_settingsPath)) ?? new();
             _store = new(Path.Combine(_settings.DataDirectory, "sources.db"), _settings.SqliteVecPath);
-            _ingestor = new(_store);
+            _ingestor = new(_store, renderJavaScript: _settings.RenderJavaScriptPages);
+            AnswerMode.SelectedIndex = _settings.AllowGeneralKnowledge ? 0 : 1;
+            _loaded = true;
+            MicLevelLabel.Text = _settings.Microphone ? "Microphone" : "Microphone off";
+            SetControls();
             await ReloadSources();
             WatchFolders();
+            // Reconcile local edits made while the app was closed and upgrade old parsers.
+            // Saved URLs are snapshots and are never fetched by startup maintenance.
+            if (_settings.Folders.Any(Directory.Exists))
+                await IndexWork(async ct =>
+                {
+                    foreach (var folder in _settings.Folders.Where(Directory.Exists))
+                        await _ingestor.ReconcileFolderAsync(folder, ct, Status);
+                });
         });
         Closed += async (_, _) =>
         {
             _closing = true; _lifetime.Cancel();
+            _runtimes.StopOwnedProcesses();
             foreach (var watcher in _watchers) watcher.Dispose();
             await StopSession();
             await _runtimes.DisposeAsync();
             _store?.Dispose();
         };
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => _runtimes.StopOwnedProcesses();
     }
 
-    private void Status(string text) => DispatcherQueue.TryEnqueue(() => { if (!_closing) StatusText.Text = text; });
+    private void Status(string text) => DispatcherQueue.TryEnqueue(() =>
+    {
+        if (_closing) return;
+        StatusText.Text = text;
+        ToolTipService.SetToolTip(StatusText, text);
+        if (text.StartsWith("Searching") || text.StartsWith("Drafting") || text.StartsWith("Preparing")) _answerBusy = true;
+        else if (text.StartsWith("Ready") || text.StartsWith("Cancelled") || text.StartsWith("Suggestion cancelled") || text.StartsWith("Stopped")) _answerBusy = false;
+        BusyIndicator.IsActive = _starting || _indexing || _asking || _answerBusy;
+        CancelButton.Visibility = _asking || _answerBusy ? Visibility.Visible : Visibility.Collapsed;
+        AnswerHelpText.Visibility = CancelButton.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+    });
     private async Task Guard(Func<Task> action)
     {
         try { await action(); }
@@ -61,39 +94,65 @@ public sealed partial class MainWindow : Window
     }
     private void SetControls()
     {
-        StartButton.IsEnabled = !_running && !_indexing;
-        StopButton.IsEnabled = _running;
-        FolderButton.IsEnabled = UrlButton.IsEnabled = RefreshButton.IsEnabled = RemoveButton.IsEnabled = !_running && !_indexing;
+        StartButton.IsEnabled = _loaded && !_running && !_indexing && !_starting && !_asking;
+        StartButton.Visibility = _running || _starting ? Visibility.Collapsed : Visibility.Visible;
+        StopButton.IsEnabled = _running || _starting;
+        StopButton.Visibility = _running || _starting ? Visibility.Visible : Visibility.Collapsed;
+        AudioMeterPanel.Visibility = _running ? Visibility.Visible : Visibility.Collapsed;
+        MicMeterPanel.Visibility = _settings.Microphone ? Visibility.Visible : Visibility.Collapsed;
+        FolderButton.IsEnabled = UrlButton.IsEnabled = RefreshButton.IsEnabled = !_running && !_indexing && !_starting && !_asking;
+        RemoveButton.IsEnabled = SourceList.SelectedItem is SourceDocument && !_running && !_indexing && !_starting && !_asking;
+        RemoveButton.Visibility = SourceList.SelectedItem is SourceDocument ? Visibility.Visible : Visibility.Collapsed;
+        AskButton.IsEnabled = MoreButton.IsEnabled = _loaded && !_indexing && !_starting && !_asking;
+        BenchmarkButton.IsEnabled = _loaded && !_running && !_indexing && !_starting && !_asking;
+        StopButton.Content = _benchmarking ? "Cancel benchmark" : "Stop listening";
+        SessionLabel.Text = _benchmarking ? "Checking device · microphone off" : _starting ? "Starting local models…" : _running ? "Listening to the meeting" : "Not listening";
+        SessionDot.Fill = _running ? Brush(51, 136, 92) : Brush(160, 172, 160);
+        TranscriptEmptyTitle.Text = _running ? "Listening for speech…" : "Start listening to see the conversation.";
+        TranscriptChannelLabel.Text = _settings.Microphone ? "System audio + microphone" : "System audio only";
+        ExportButton.Visibility = _transcript.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        BusyIndicator.IsActive = _starting || _indexing || _asking || _answerBusy;
+        CancelButton.Visibility = _asking || _answerBusy ? Visibility.Visible : Visibility.Collapsed;
+        AnswerHelpText.Visibility = CancelButton.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
     }
     private async void StartButton_Click(object sender, RoutedEventArgs e) => await Guard(async () =>
     {
-        if (_running || _indexing) return;
+        if (_running || _indexing || _starting || _asking) return;
         RuntimeSettings.LocalUri(_settings.WhisperEndpoint);
         RuntimeSettings.LocalUri(_settings.GeneratorEndpoint);
         Status("Checking local inference runtimes…");
-        StartButton.IsEnabled = false;
+        _starting = true;
+        SetControls();
+        using var startup = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _startCancellation = startup;
         try
         {
-            await _runtimes.EnsureAsync(_settings, false, _lifetime.Token);
+            await _runtimes.EnsureSpeechAsync(_settings, startup.Token);
+            await EnsureRetrievalAsync(startup.Token);
             using (var whisper = LocalHttp.Create(_settings.WhisperEndpoint))
-            using (var response = await whisper.GetAsync("health", _lifetime.Token))
-                response.EnsureSuccessStatusCode();
-            using (var llama = LocalHttp.Create(_settings.GeneratorEndpoint))
-            using (var response = await llama.GetAsync("health", _lifetime.Token))
+            using (var response = await whisper.GetAsync("health", startup.Token))
                 response.EnsureSuccessStatusCode();
             var worker = Path.Combine(AppContext.BaseDirectory, "workers", "MeetingTeleprompter.Host.exe");
             if (!File.Exists(worker)) throw new FileNotFoundException("Worker executable is missing. Rebuild the application.", worker);
-            await _indexGate.WaitAsync(_lifetime.Token);
+            await _indexGate.WaitAsync(startup.Token);
             _running = true;
             _indexGate.Release();
-            _transcript.Clear(); SuggestionPanel.Children.Clear();
+            _transcript.Clear(); ClearDraft(); _draftRevision = 0; SuggestionPanel.Children.Clear();
             var version = ++_sessionVersion;
             _asrWorker = new(worker, "asr-worker");
             _generatorWorker = new(worker, "generator-worker");
             var audio = new WasapiAudioSource(_settings);
             audio.HealthChanged += Status;
-            _pipeline = new(audio, new PipeTranscriber(_asrWorker, _settings.WhisperEndpoint), Retriever(),
-                new PipeGenerator(_generatorWorker, _settings.GeneratorEndpoint));
+            audio.LevelChanged += (channel, level, speaking) => DispatcherQueue.TryEnqueue(() =>
+            {
+                if (version != _sessionVersion || !_running) return;
+                var meter = channel == "local" ? MicLevel : RemoteLevel;
+                meter.Value = level;
+                if (channel == "local") MicLevelLabel.Text = speaking ? "You · speech" : "Microphone";
+                else RemoteLevelLabel.Text = speaking ? "Meeting · speech" : "System audio";
+            });
+            _pipeline = new(audio, new PipeTranscriber(_asrWorker, _settings.WhisperEndpoint, _settings.SpeechVocabulary, _settings.WhisperBeamSize), Retriever(),
+                new BudgetedGenerator(new PipeGenerator(_generatorWorker, _settings.GeneratorEndpoint), _runtimes, _settings)) { AllowGeneralKnowledge = AnswerMode.SelectedIndex == 0 };
             _pipeline.StatusChanged += Status;
             _pipeline.PartialTranscript += entry => DispatcherQueue.TryEnqueue(() =>
             {
@@ -102,13 +161,36 @@ public sealed partial class MainWindow : Window
             _pipeline.StableTranscript += entry => DispatcherQueue.TryEnqueue(() =>
             {
                 if (version != _sessionVersion || !_running) return;
-                _transcript.Add(new(entry, $"{entry.Start:mm\\:ss} · {(entry.Channel == "local" ? "You" : "Remote")}", entry.Text));
+                var item = new TranscriptItem(entry, $"{entry.Start:mm\\:ss} · {(entry.Channel == "local" ? "You" : "Remote")}" + (entry.IsCorrection ? " · corrected" : ""), entry.Text);
+                var old = _transcript.FirstOrDefault(x => x.Entry.Channel == entry.Channel && x.Entry.SegmentId == entry.SegmentId);
+                if (entry.IsCorrection && old is not null)
+                {
+                    if (entry.Text.Length == 0) _transcript.Remove(old);
+                    else _transcript[_transcript.IndexOf(old)] = item;
+                }
+                else if (!entry.IsCorrection) _transcript.Add(item);
+                if (_transcript.Count == 0) return;
+                if (entry.Confidence < .55) _transcript[^1] = _transcript[^1] with { Header = _transcript[^1].Header + " · review wording" };
+                TranscriptEmpty.Visibility = Visibility.Collapsed;
+                ExportButton.Visibility = Visibility.Visible;
                 while (_transcript.Count > 600) _transcript.RemoveAt(0);
                 TranscriptList.ScrollIntoView(_transcript.Last());
             });
             _pipeline.SuggestionReady += suggestion => DispatcherQueue.TryEnqueue(() =>
             {
                 if (version == _sessionVersion && _running) ShowSuggestion(suggestion);
+            });
+            _pipeline.SuggestionProgress += (revision, question, basis, draft) => DispatcherQueue.TryEnqueue(() =>
+            {
+                if (version == _sessionVersion && _running) ShowDraft(revision, question, basis, draft);
+            });
+            _pipeline.SuggestionCompleted += revision => DispatcherQueue.TryEnqueue(() =>
+            {
+                if (version == _sessionVersion && _running)
+                {
+                    if (revision == _draftRevision) _answerBusy = false;
+                    ClearDraft(revision); SetControls();
+                }
             });
             SetControls();
             _ = ObserveSession(_pipeline.StartAsync(_lifetime.Token), version);
@@ -117,6 +199,12 @@ public sealed partial class MainWindow : Window
         {
             await StopSession();
             throw;
+        }
+        finally
+        {
+            _startCancellation = null;
+            _starting = false;
+            if (!_closing) SetControls();
         }
     });
     private async Task ObserveSession(Task session, int version)
@@ -127,36 +215,104 @@ public sealed partial class MainWindow : Window
         await StopSession();
         Status(error is null ? "Session ended." : "Session stopped: " + error);
     }
-    private IRetriever Retriever() => _settings.SemanticSearch
+    private IRetriever Retriever() => _settings.SemanticSearch && _semanticAvailable
         ? new HybridRetriever(_store, new LlamaEmbedder(_settings.EmbeddingEndpoint), _settings.EmbeddingModel)
         : _store;
+
+    private async Task EnsureRetrievalAsync(CancellationToken ct)
+    {
+        _semanticAvailable = _settings.SemanticSearch;
+        if (!_semanticAvailable) return;
+        if (_settings.ConserveMemory && !RuntimeMemoryBudget.CanLoad(_settings.EmbeddingModelPath, _runtimes.IsRunning("embeddings")))
+        {
+            _semanticAvailable = false;
+            Status("Ready · low memory: using keyword search to preserve meeting headroom.");
+            return;
+        }
+        await _runtimes.EnsureAsync(_settings, true, ct);
+    }
 
     private async void StopButton_Click(object sender, RoutedEventArgs e) => await Guard(StopSession);
     private async Task StopSession()
     {
-        _running = false; _sessionVersion++;
+        _startCancellation?.Cancel();
+        _askCancellation?.Cancel();
+        _running = false; _answerBusy = false; _sessionVersion++;
         var pipeline = _pipeline; _pipeline = null;
         if (pipeline is not null) await pipeline.DisposeAsync();
         if (_asrWorker is not null) { await _asrWorker.DisposeAsync(); _asrWorker = null; }
         if (_generatorWorker is not null) { await _generatorWorker.DisposeAsync(); _generatorWorker = null; }
-        _transcript.Clear(); SuggestionPanel.Children.Clear();
+        _transcript.Clear(); ClearDraft(); _draftRevision = 0; SuggestionPanel.Children.Clear();
         PartialText.Text = "";
+        AnswerEmpty.Visibility = TranscriptEmpty.Visibility = Visibility.Visible;
+        ExportButton.Visibility = Visibility.Collapsed;
+        RemoteLevel.Value = MicLevel.Value = 0;
+        RemoteLevelLabel.Text = "System audio";
+        MicLevelLabel.Text = _settings.Microphone ? "Microphone" : "Microphone off";
+        SearchBox.Text = "";
         if (!_closing) { SetControls(); Status("Stopped · ephemeral transcript cleared."); }
+    }
+
+    private void ShowDraft(long revision, string question, AnswerBasis? basis, string draft)
+    {
+        if (revision < _draftRevision) return;
+        if (_draftPanel is null || revision != _draftRevision)
+        {
+            ClearDraft();
+            _draftRevision = revision;
+            _draftLabel = new TextBlock { FontSize = 10, CharacterSpacing = 90, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = Brush(151, 103, 40) };
+            _draftText = new TextBlock { TextWrapping = TextWrapping.Wrap, FontSize = 17, Foreground = Brush(39, 58, 43), IsTextSelectionEnabled = true };
+            _draftPanel = new StackPanel { Spacing = 10, Padding = new Thickness(16), Background = Brush(255, 249, 234) };
+            _draftPanel.Children.Add(_draftLabel);
+            _draftPanel.Children.Add(new TextBlock { Text = question, FontSize = 13, TextWrapping = TextWrapping.Wrap, Foreground = Brush(100, 111, 94) });
+            _draftPanel.Children.Add(_draftText);
+            SuggestionPanel.Children.Insert(0, _draftPanel);
+            AnswerEmpty.Visibility = Visibility.Collapsed;
+            AnswersScroll.ChangeView(null, 0, null);
+        }
+        _draftLabel!.Text = basis == AnswerBasis.Sources ? "DRAFT FROM SOURCES · checking citations" : basis == AnswerBasis.GeneralKnowledge ? "GENERAL DRAFT · verify before using" : "PREPARING ANSWER";
+        _draftText!.Text = draft.Length == 0 ? "Finding an answer…" : draft;
+    }
+
+    private void ClearDraft(long? revision = null)
+    {
+        if (_draftPanel is null || (revision is not null && revision != _draftRevision)) return;
+        SuggestionPanel.Children.Remove(_draftPanel);
+        _draftPanel = null; _draftLabel = null; _draftText = null;
+        if (SuggestionPanel.Children.Count == 0) AnswerEmpty.Visibility = Visibility.Visible;
     }
 
     private void ShowSuggestion(Suggestion suggestion)
     {
-        var panel = new StackPanel { Spacing = 8 };
-        panel.Children.Add(new TextBlock { Text = suggestion.IsGeneratedAssistance ? "GENERATED ASSISTANCE · verify against sources" : "SOURCE EVIDENCE", FontSize = 11, Foreground = Brush(147, 197, 181), TextWrapping = TextWrapping.Wrap });
-        panel.Children.Add(new TextBlock { Text = suggestion.Text, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
+        ClearDraft();
+        AnswerEmpty.Visibility = Visibility.Collapsed;
+        var panel = new StackPanel { Spacing = 14 };
+        var general = suggestion.Basis == AnswerBasis.GeneralKnowledge;
+        var needsSource = suggestion.Basis == AnswerBasis.NeedsSource;
+        var limited = suggestion.Basis == AnswerBasis.ResourceLimited;
+        var labelText = general ? "GENERAL KNOWLEDGE" : limited ? "DEVICE BUSY" : needsSource ? "MORE EVIDENCE NEEDED" : suggestion.IsGeneratedAssistance ? "FROM YOUR SOURCES" : "SOURCE EVIDENCE";
+        panel.Children.Add(new TextBlock { Text = labelText + "  ·  " + suggestion.CreatedAt.ToLocalTime().ToString("HH:mm"), FontSize = 10, CharacterSpacing = 90, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = general || needsSource ? Brush(151, 103, 40) : Brush(52, 116, 77), TextWrapping = TextWrapping.Wrap });
+        if (suggestion.Question.Length > 0) panel.Children.Add(new TextBlock { Text = suggestion.Question, FontSize = 13, Foreground = Brush(119, 132, 113), TextWrapping = TextWrapping.Wrap, MaxLines = 3 });
+        panel.Children.Add(new TextBlock { Text = suggestion.Text, FontSize = 19, LineHeight = 29, Foreground = Brush(39, 58, 43), TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
+        panel.Children.Add(new TextBlock { Text = general ? "Generated assistance. Not verified by your documents. No web lookup was made." : needsSource ? "Add a source in the sidebar, then ask again." : suggestion.IsGeneratedAssistance ? "Generated assistance. Check the linked passages before relying on this response." : "Retrieved source passages. Open a citation to review its location.", FontSize = 11, Foreground = Brush(127, 134, 116), TextWrapping = TextWrapping.Wrap });
         for (var i = 0; i < suggestion.Sources.Count; i++)
         {
             var source = suggestion.Sources[i];
             var label = $"[{i + 1}] {source.Title} · " + (source.Page is int page ? $"page {page}" : $"chunk {source.ChunkIndex + 1}");
-            if (source.FetchedAt is { } fetched) label += $" · fetched {fetched:yyyy-MM-dd HH:mm}";
-            var button = new Button { Content = new TextBlock { Text = label, FontSize = 11, TextWrapping = TextWrapping.Wrap }, HorizontalAlignment = HorizontalAlignment.Stretch };
+            if (source.Heading.Length > 0) label += " · " + source.Heading;
+            if (source.FetchedAt is { } fetched) label += $" · fetched {fetched.ToLocalTime():yyyy-MM-dd HH:mm}";
+            var passage = suggestion.Evidence?.ElementAtOrDefault(i)?.Text;
+            var button = new Button { Content = new TextBlock { Text = label, FontSize = 11, TextWrapping = TextWrapping.Wrap }, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Left, Background = Brush(242, 246, 239), BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(8) };
             button.Click += async (_, _) => await Guard(async () =>
             {
+                if (passage is not null)
+                {
+                    var content = new StackPanel { Spacing = 12, MinWidth = 400, MaxWidth = 600 };
+                    content.Children.Add(new TextBlock { Text = label, TextWrapping = TextWrapping.Wrap, FontSize = 12 });
+                    content.Children.Add(new TextBlock { Text = passage, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
+                    content.Children.Add(new TextBlock { Text = source.CanonicalLocation, TextWrapping = TextWrapping.Wrap, FontSize = 11, IsTextSelectionEnabled = true });
+                    if (await Dialog("Cited passage", new ScrollViewer { Content = content, MaxHeight = 450 }, "Open original").ShowAsync() != ContentDialogResult.Primary) return;
+                }
                 if (source.Type == "url")
                 {
                     var uri = new Uri(source.CanonicalLocation);
@@ -171,14 +327,40 @@ public sealed partial class MainWindow : Window
             });
             panel.Children.Add(button);
         }
-        SuggestionPanel.Children.Insert(0, new Border { Child = panel, Padding = new Thickness(14), CornerRadius = new CornerRadius(8), Background = Brush(28, 35, 51) });
+        var copy = new Button { Content = "Copy answer", FontSize = 11, Padding = new Thickness(10, 5, 10, 5), Background = Brush(247, 248, 244), CornerRadius = new CornerRadius(6) };
+        copy.Click += (_, _) =>
+        {
+            var data = new Windows.ApplicationModel.DataTransfer.DataPackage();
+            var references = string.Join("\n", suggestion.Sources.Select((x, i) => $"[{i + 1}] {x.Title} — {x.CanonicalLocation}"));
+            data.SetText(labelText + "\n" + suggestion.Text + (general ? "\nGeneral knowledge — not verified by sources." : "\n" + references));
+            Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(data);
+            Status("Answer copied, including its source label.");
+        };
+        panel.Children.Add(copy);
+        var routes = new Button { Content = "Explore this answer", FontSize = 11, Padding = new Thickness(10, 5, 10, 5), CornerRadius = new CornerRadius(6) };
+        var menu = new MenuFlyout();
+        foreach (var (title, route) in new[] { ("Concise answer", "concise"), ("Supporting evidence", "evidence"), ("Explain simply", "explain"), ("Check this claim", "check"), ("Suggest a follow-up", "follow-up") })
+        {
+            var item = new MenuFlyoutItem { Text = title };
+            item.Click += async (_, _) => await Guard(() => AskAsync(route, suggestion.Question));
+            menu.Items.Add(item);
+        }
+        routes.Flyout = menu;
+        panel.Children.Add(routes);
+        SuggestionPanel.Children.Insert(0, new Border { Child = panel, Padding = new Thickness(22), CornerRadius = new CornerRadius(14), Background = Brush(255, 255, 255), BorderBrush = general || needsSource ? Brush(231, 211, 174) : Brush(215, 227, 210), BorderThickness = new Thickness(1) });
         while (SuggestionPanel.Children.Count > 15) SuggestionPanel.Children.RemoveAt(15);
+        AnswersScroll.ChangeView(null, 0, null);
     }
     private static SolidColorBrush Brush(byte r, byte g, byte b) => new(Windows.UI.Color.FromArgb(255, r, g, b));
     private async Task ReloadSources()
     {
         var sources = await _store.ListAsync(_lifetime.Token);
         _sources.Clear(); foreach (var source in sources) _sources.Add(source);
+        var indexed = _sources.Count(x => x.ContentHash.Length > 0);
+        var failed = _sources.Count(x => x.Status == "failed");
+        SourceCountText.Text = $"{indexed} indexed document{(indexed == 1 ? "" : "s")}" + (failed > 0 ? $" · {failed} need attention" : "");
+        SourcesButton.Content = _sources.Count > 0 ? $"Sources ({_sources.Count})" : "Sources";
+        SetControls();
     }
     private void WatchFolders()
     {
@@ -186,40 +368,48 @@ public sealed partial class MainWindow : Window
         _watchers.Clear();
         foreach (var folder in _settings.Folders.Where(Directory.Exists))
         {
-            var watcher = new FileSourceWatcher(folder, async (path, ct) =>
+            async Task IndexChange(string? path, CancellationToken ct)
             {
-                while (_running || _indexing) await Task.Delay(1000, ct);
+                while (_running || _indexing || _starting || _asking) await Task.Delay(1000, ct);
                 await _indexGate.WaitAsync(ct);
                 try
                 {
                     if (_running) return;
-                    await _ingestor.IndexFileAsync(path, ct);
+                    if (path is null) await _ingestor.ReconcileFolderAsync(folder, ct, Status);
+                    else await _ingestor.IndexFileAsync(path, ct);
                     await IndexVectors(ct);
                     DispatcherQueue.TryEnqueue(async () => await Guard(ReloadSources));
                 }
                 finally { _indexGate.Release(); }
-            });
+            }
+            var watcher = new FileSourceWatcher(folder, (path, ct) => IndexChange(path, ct), reconcile: ct => IndexChange(null, ct));
             watcher.Failed += Status; _watchers.Add(watcher);
         }
     }
     private async Task SaveSettings()
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
-        await File.WriteAllTextAsync(_settingsPath + ".tmp", JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
-        File.Move(_settingsPath + ".tmp", _settingsPath, true);
+        await _settingsGate.WaitAsync();
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
+            await File.WriteAllTextAsync(_settingsPath + ".tmp", JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
+            File.Move(_settingsPath + ".tmp", _settingsPath, true);
+        }
+        finally { _settingsGate.Release(); }
     }
     private async Task IndexVectors(CancellationToken ct)
     {
         if (_settings.SemanticSearch)
         {
-            await _runtimes.EnsureAsync(_settings, true, ct);
-            await new HybridRetriever(_store, new LlamaEmbedder(_settings.EmbeddingEndpoint), _settings.EmbeddingModel).IndexMissingAsync(ct);
+            await EnsureRetrievalAsync(ct);
+            if (_semanticAvailable) await new HybridRetriever(_store, new LlamaEmbedder(_settings.EmbeddingEndpoint), _settings.EmbeddingModel).IndexMissingAsync(ct);
         }
     }
     private async Task IndexWork(Func<CancellationToken, Task> work)
     {
-        if (_running || _indexing) return;
+        if (_running || _indexing || _starting || _asking) return;
         _indexing = true; SetControls();
+        Status("Updating local sources…");
         try
         {
             await _indexGate.WaitAsync(_lifetime.Token);
@@ -228,6 +418,7 @@ public sealed partial class MainWindow : Window
             await ReloadSources();
             Status($"Ready · {_sources.Count} indexed sources.");
         }
+        catch { await ReloadSources(); throw; }
         finally { _indexing = false; SetControls(); }
     }
     private async void Folder_Click(object sender, RoutedEventArgs e) => await Guard(async () =>
@@ -256,8 +447,12 @@ public sealed partial class MainWindow : Window
         {
             foreach (var source in await _store.ListAsync(ct))
             {
-                if (source.Type == "url") await _ingestor.IndexUrlAsync(source.Location, ct);
-                else await _ingestor.IndexFileAsync(source.Location, ct);
+                try
+                {
+                    if (source.Type == "url") await _ingestor.IndexUrlAsync(source.Location, ct);
+                    else await _ingestor.IndexFileAsync(source.Location, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException) { Status(source.Title + ": " + ex.Message); }
             }
             foreach (var folder in _settings.Folders.Where(Directory.Exists)) await _ingestor.IndexFolderAsync(folder, ct, Status);
         });
@@ -265,26 +460,79 @@ public sealed partial class MainWindow : Window
     private async void Remove_Click(object sender, RoutedEventArgs e) => await Guard(async () =>
     {
         if (SourceList.SelectedItem is not SourceDocument source) return;
+        var warning = source.Type == "file"
+            ? "This removes the indexed copy and stops watching its containing folder. The original file will stay on disk."
+            : "This removes the saved web page and its index. You can add it again later.";
+        if (await Dialog("Remove “" + source.Title + "”?", new TextBlock { Text = warning, TextWrapping = TextWrapping.Wrap }, "Remove").ShowAsync() != ContentDialogResult.Primary) return;
         // Removing a file source also stops watching its containing root, so it cannot silently reappear.
         await IndexWork(ct => _store.RemoveAsync(source.Id, ct));
         _settings.Folders.RemoveAll(folder => source.Type == "file" && source.Location.StartsWith(Path.TrimEndingDirectorySeparator(folder) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
         await SaveSettings(); WatchFolders();
         Status("Source and derived index removed. Its containing folder is no longer watched.");
     });
-    private async void Search_Click(object sender, RoutedEventArgs e) => await Guard(async () =>
+    private void SourceSelection_Changed(object sender, SelectionChangedEventArgs e) { if (_loaded) SetControls(); }
+    private async void Route_Click(object sender, RoutedEventArgs e) => await Guard(() => AskAsync((string)((FrameworkElement)sender).Tag));
+    private async void Ask_Click(object sender, RoutedEventArgs e) => await Guard(() => AskAsync("concise"));
+    private async Task AskAsync(string route, string? selectedQuestion = null)
     {
-        var query = SearchBox.Text;
-        var results = await Task.Run(() => Retriever().SearchAsync(query, 5, _lifetime.Token));
-        if (results.Count == 0) { Status("No matching indexed passages."); return; }
-        ShowSuggestion(new(Guid.NewGuid().ToString("N"), string.Join("\n\n", results.Select((x, i) => $"[{i + 1}] {x.Text}")), "evidence", false, results.Select(x => x.Source).ToArray(), DateTimeOffset.UtcNow));
-    });
-    private void Route_Click(object sender, RoutedEventArgs e)
-    {
-        if (_pipeline is null) Status("Start a session to use conversation routes.");
-        else _pipeline.RequestSuggestion((string)((Button)sender).Tag);
+        if (!_loaded || _asking || _starting || _indexing) return;
+        var question = (selectedQuestion ?? SearchBox.Text).Trim();
+        if (_pipeline is not null) { _pipeline.RequestSuggestion(route, question.Length == 0 ? null : question); return; }
+        if (question.Length == 0) { Status("Type a question, or start a session to use the conversation."); return; }
+        _asking = true; SetControls();
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        request.CancelAfter(TimeSpan.FromMinutes(3));
+        _askCancellation = request;
+        try
+        {
+            Status("Preparing local assistance…");
+            // Typed questions never open the microphone or start the speech runtime.
+            await EnsureRetrievalAsync(request.Token);
+            var state = new ConversationState();
+            state.Add(new(Guid.NewGuid().ToString("N"), "typed", question, TimeSpan.Zero, TimeSpan.Zero, 1, DateTimeOffset.UtcNow));
+            var workerPath = Path.Combine(AppContext.BaseDirectory, "workers", "MeetingTeleprompter.Host.exe");
+            await using var worker = new PipeInferenceClient(workerPath, "generator-worker");
+            var service = new AnswerService(Retriever(), new BudgetedGenerator(new PipeGenerator(worker, _settings.GeneratorEndpoint), _runtimes, _settings));
+            var revision = ++_draftRevision;
+            var answer = await service.AnswerAsync(state.Snapshot(), route, AnswerMode.SelectedIndex == 0, WorkPriority.UserGeneration, request.Token, Status,
+                (basis, text) => DispatcherQueue.TryEnqueue(() => { if (ReferenceEquals(_askCancellation, request) && !request.IsCancellationRequested && !_closing) ShowDraft(revision, question, basis, text); }));
+            request.Token.ThrowIfCancellationRequested();
+            ShowSuggestion(answer);
+            Status("Ready · " + (answer.Basis == AnswerBasis.GeneralKnowledge ? "general answer — verify before using" : "sources checked"));
+        }
+        finally { ClearDraft(); _askCancellation = null; _asking = false; _answerBusy = false; if (!_closing) SetControls(); }
     }
-    private void Cancel_Click(object sender, RoutedEventArgs e) { _pipeline?.CancelSuggestion(); Status("Suggestion cancelled."); }
-    private async void ClearButton_Click(object sender, RoutedEventArgs e) => await Guard(StopSession);
+    private void Cancel_Click(object sender, RoutedEventArgs e) { _askCancellation?.Cancel(); _pipeline?.CancelSuggestion(); Status("Suggestion cancelled."); }
+    private async void SearchBox_KeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs e)
+    {
+        if (e.Key != Windows.System.VirtualKey.Enter) return;
+        e.Handled = true; await Guard(() => AskAsync("concise"));
+    }
+    private async void AnswerMode_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_loaded) return;
+        _askCancellation?.Cancel();
+        if (_pipeline is not null) { _pipeline.CancelSuggestion(); _pipeline.AllowGeneralKnowledge = AnswerMode.SelectedIndex == 0; }
+        _settings = _settings with { AllowGeneralKnowledge = AnswerMode.SelectedIndex == 0 };
+        AnswerHelpText.Text = _settings.AllowGeneralKnowledge ? "If your sources don't cover it, general answers are clearly labeled." : "Answers use only the documents you added.";
+        await Guard(SaveSettings);
+    }
+    private void Root_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (SourcesPane is null || TranscriptColumn is null) return;
+        SetSourceVisibility(_sourcesVisible && e.NewSize.Width >= 1180);
+        TranscriptColumn.Width = new GridLength(e.NewSize.Width < 1100 ? 260 : 310);
+    }
+    private void Sources_Click(object sender, RoutedEventArgs e)
+    {
+        _sourcesVisible = SourcesPane.Visibility != Visibility.Visible;
+        SetSourceVisibility(_sourcesVisible);
+    }
+    private void SetSourceVisibility(bool visible)
+    {
+        SourcesPane.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        SourcesColumn.Width = new GridLength(visible ? 236 : 0);
+    }
     private async void ExportButton_Click(object sender, RoutedEventArgs e) => await Guard(async () =>
     {
         if (_transcript.Count == 0) { Status("No transcript to export. Export before stopping the ephemeral session."); return; }
@@ -301,18 +549,54 @@ public sealed partial class MainWindow : Window
     }
     private ContentDialog Dialog(string title, object content, string primary) => new()
     {
-        Title = title, Content = content, PrimaryButtonText = primary, CloseButtonText = "Cancel", XamlRoot = Root.XamlRoot, RequestedTheme = ElementTheme.Dark
+        Title = title, Content = content, PrimaryButtonText = primary, CloseButtonText = "Cancel", XamlRoot = Root.XamlRoot, RequestedTheme = ElementTheme.Light
     };
+    private async void Benchmark_Click(object sender, RoutedEventArgs e) => await Guard(async () =>
+    {
+        if (_running || _starting || _indexing || _asking) return;
+        var picker = new FileOpenPicker(); picker.FileTypeFilter.Add(".wav");
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
+        var sample = await picker.PickSingleFileAsync();
+        if (sample is null) return;
+        var pcm = await Task.Run(() => WaveAudio.ReadPcm(sample.Path));
+        _starting = _benchmarking = true; SetControls();
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        request.CancelAfter(TimeSpan.FromMinutes(5)); _startCancellation = request;
+        try
+        {
+            Status("Checking local model speed · microphone off…");
+            await _runtimes.DisposeAsync();
+            var result = await Task.Run(() => DeviceBenchmark.RunAsync(_settings, pcm, request.Token));
+            var report = Path.Combine(_settings.DataDirectory, "device-benchmark.json");
+            Directory.CreateDirectory(_settings.DataDirectory);
+            await File.WriteAllTextAsync(report, JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }), request.Token);
+            var content = new TextBlock { Text = DeviceBenchmark.Describe(result) + "\n\nThis checks one supplied audio sample; it does not certify a sustained live call. Audio and transcript text are not saved.", TextWrapping = TextWrapping.Wrap, MaxWidth = 500 };
+            if (await Dialog("Device check", content, "Use low-latency speech").ShowAsync() == ContentDialogResult.Primary)
+            {
+                _settings = _settings with { WhisperAudioContext = 512, WhisperBeamSize = 1 };
+                await SaveSettings();
+            }
+            Status("Ready · device report saved to " + report);
+        }
+        finally { _starting = _benchmarking = false; _startCancellation = null; if (!_closing) SetControls(); }
+    });
     private async void Settings_Click(object sender, RoutedEventArgs e) => await Guard(async () =>
     {
-        if (_running || _indexing) { Status("Stop the session and finish indexing before changing settings."); return; }
+        if (_running || _indexing || _starting || _asking) { Status("Stop the session and finish assistance or indexing before changing settings."); return; }
         var whisper = new TextBox { Header = "whisper.cpp server", Text = _settings.WhisperEndpoint };
         var generator = new TextBox { Header = "llama.cpp generation server", Text = _settings.GeneratorEndpoint };
         var embedding = new TextBox { Header = "llama.cpp embedding server", Text = _settings.EmbeddingEndpoint };
         var model = new TextBox { Header = "Embedding model/version (change when replacing weights)", Text = _settings.EmbeddingModel };
         var semantic = new CheckBox { Content = "Enable semantic + keyword retrieval", IsChecked = _settings.SemanticSearch };
+        var javaScript = new CheckBox { Content = "Render JavaScript-only web sources with installed Edge", IsChecked = _settings.RenderJavaScriptPages };
+        var conserve = new CheckBox { Content = "Keep 2 GiB of free RAM for the meeting (recommended)", IsChecked = _settings.ConserveMemory };
         var mic = new CheckBox { Content = "Capture my microphone", IsChecked = _settings.Microphone };
         var data = new TextBox { Header = "Local index directory", Text = _settings.DataDirectory };
+        var speechProfile = new ComboBox { Header = "Speech profile", ItemsSource = new[] { "Low latency (meeting windows)", "Full context (slower)" }, SelectedIndex = _settings.WhisperAudioContext == 512 ? 0 : 1, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var threshold = new Slider { Header = "Voice threshold · lower catches quieter speech", Minimum = .35, Maximum = .8, StepFrequency = .05, Value = _settings.VoiceThreshold };
+        var pause = new Slider { Header = "Pause before finalizing (milliseconds)", Minimum = 400, Maximum = 1400, StepFrequency = 100, Value = _settings.EndSilenceMs };
+        var vocabulary = new TextBox { Header = "Names and technical terms", PlaceholderText = "e.g. Shashank, Kubernetes, Acme", Text = _settings.SpeechVocabulary, MaxLength = 400, TextWrapping = TextWrapping.Wrap };
+        var decoder = new ComboBox { Header = "Recognition decoding", ItemsSource = new[] { "Fast · one candidate", "Careful · compare three candidates (slower)" }, SelectedIndex = _settings.WhisperBeamSize > 1 ? 1 : 0, HorizontalAlignment = HorizontalAlignment.Stretch };
         var whisperExe = new TextBox { Header = "whisper-server.exe path (optional managed startup)", Text = _settings.WhisperExecutable };
         var whisperModel = new TextBox { Header = "Whisper base.en model path", Text = _settings.WhisperModel };
         var llamaExe = new TextBox { Header = "llama-server.exe path (optional managed startup)", Text = _settings.LlamaExecutable };
@@ -331,15 +615,23 @@ public sealed partial class MainWindow : Window
         }
         var outputDevice = Devices(NAudio.CoreAudioApi.DataFlow.Render, "Meeting output device", _settings.OutputDeviceId);
         var inputDevice = Devices(NAudio.CoreAudioApi.DataFlow.Capture, "Microphone device", _settings.MicrophoneDeviceId);
-        foreach (var control in new UIElement[] { whisper, generator, embedding, whisperExe, whisperModel, llamaExe, generatorModel, embeddingModel, sileroModel, sqliteVec, semantic, model, mic, outputDevice, inputDevice, data }) panel.Children.Add(control);
-        panel.Children.Add(new TextBlock { Text = "Models are installed separately. See README for local runtime startup. No cloud inference or automatic web refresh.", TextWrapping = TextWrapping.Wrap, FontSize = 12 });
-        if (await Dialog("Local runtime settings", new ScrollViewer { Content = panel, MaxHeight = 550 }, "Save").ShowAsync() != ContentDialogResult.Primary) return;
+        panel.Children.Add(new TextBlock { Text = "Speech & listening", FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+        foreach (var control in new UIElement[] { mic, outputDevice, inputDevice, threshold, pause, vocabulary, decoder, speechProfile }) panel.Children.Add(control);
+        panel.Children.Add(new TextBlock { Text = "English speech model. Use headphones to avoid echo between system audio and your microphone. A lower threshold can also pick up more background noise. Names are hints, not guaranteed corrections.", TextWrapping = TextWrapping.Wrap, FontSize = 12, Foreground = Brush(105, 120, 100) });
+        var advanced = new StackPanel { Spacing = 10 };
+        foreach (var control in new UIElement[] { whisper, generator, embedding, whisperExe, whisperModel, llamaExe, generatorModel, embeddingModel, sileroModel, sqliteVec, semantic, javaScript, conserve, model, data }) advanced.Children.Add(control);
+        panel.Children.Add(new Expander { Header = "Advanced · local models and index", Content = advanced, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch });
+        if (await Dialog("Make it sound like you", new ScrollViewer { Content = panel, MaxHeight = 550, Padding = new Thickness(0, 0, 12, 0) }, "Save settings").ShowAsync() != ContentDialogResult.Primary) return;
         RuntimeSettings.LocalUri(whisper.Text); RuntimeSettings.LocalUri(generator.Text); RuntimeSettings.LocalUri(embedding.Text);
         var directory = Path.GetFullPath(data.Text);
         _settings = _settings with { WhisperEndpoint = whisper.Text, GeneratorEndpoint = generator.Text, EmbeddingEndpoint = embedding.Text, SemanticSearch = semantic.IsChecked == true, Microphone = mic.IsChecked == true, DataDirectory = directory, EmbeddingModel = model.Text, OutputDeviceId = ((DeviceOption)outputDevice.SelectedItem).Id, MicrophoneDeviceId = ((DeviceOption)inputDevice.SelectedItem).Id };
-        _settings = _settings with { WhisperExecutable = whisperExe.Text, WhisperModel = whisperModel.Text, LlamaExecutable = llamaExe.Text, GeneratorModel = generatorModel.Text, EmbeddingModelPath = embeddingModel.Text, SileroModelPath = sileroModel.Text, SqliteVecPath = sqliteVec.Text };
+        _settings = _settings with { WhisperExecutable = whisperExe.Text, WhisperModel = whisperModel.Text, WhisperAudioContext = speechProfile.SelectedIndex == 0 ? 512 : 0, LlamaExecutable = llamaExe.Text, GeneratorModel = generatorModel.Text, EmbeddingModelPath = embeddingModel.Text, SileroModelPath = sileroModel.Text, SqliteVecPath = sqliteVec.Text };
+        _settings = _settings with { VoiceThreshold = threshold.Value, EndSilenceMs = (int)pause.Value, SpeechVocabulary = vocabulary.Text.Trim(), WhisperBeamSize = decoder.SelectedIndex == 1 ? 3 : 1 };
+        _settings = _settings with { RenderJavaScriptPages = javaScript.IsChecked == true };
+        _settings = _settings with { ConserveMemory = conserve.IsChecked == true };
+        MicLevelLabel.Text = _settings.Microphone ? "Microphone" : "Microphone off";
         await _runtimes.DisposeAsync();
-        _store.Dispose(); _store = new(Path.Combine(directory, "sources.db"), _settings.SqliteVecPath); _ingestor = new(_store);
+        _store.Dispose(); _store = new(Path.Combine(directory, "sources.db"), _settings.SqliteVecPath); _ingestor = new(_store, renderJavaScript: _settings.RenderJavaScriptPages);
         await SaveSettings(); await ReloadSources(); WatchFolders(); Status("Settings saved.");
     });
     public sealed record TranscriptItem(StableUtterance Entry, string Header, string Text);

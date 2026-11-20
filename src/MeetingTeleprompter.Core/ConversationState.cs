@@ -15,9 +15,23 @@ public sealed class ConversationState
 
     public void Add(StableUtterance utterance)
     {
+        // Bound individual segments as well as the number of recent utterances.
+        utterance = utterance with { Text = utterance.Text[..Math.Min(utterance.Text.Length, 2400)] };
+        if (utterance.IsCorrection)
+        {
+            var revised = _recent.Select(x => x.Channel == utterance.Channel && x.SegmentId == utterance.SegmentId ? utterance : x)
+                .Where(x => !string.IsNullOrWhiteSpace(x.Text)).ToArray();
+            _recent.Clear(); _entities.Clear(); _topics.Clear(); _decisions.Clear(); _questions.Clear();
+            foreach (var entry in revised) { _recent.Enqueue(entry); Analyze(entry); }
+            return;
+        }
         _recent.Enqueue(utterance);
         while (_recent.Count > _maxRecent) _recent.Dequeue();
+        Analyze(utterance);
+    }
 
+    private void Analyze(StableUtterance utterance)
+    {
         foreach (Match match in Regex.Matches(utterance.Text, @"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*|[A-Z]{2,8})\b"))
             _entities.Add(match.Value);
 

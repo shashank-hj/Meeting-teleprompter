@@ -6,7 +6,7 @@ using MeetingTeleprompter.Core;
 
 internal static class ModelValidation
 {
-    private sealed record Sample(string Id, string Meeting, string Path, string Reference, int Row);
+    private sealed record Sample(string Id, string Meeting, string Path, string Reference, int Row, string[]? DomainTerms = null);
     public static async Task RunAsync(string settingsPath, string samplesPath, string reportPath)
     {
         var settings = JsonSerializer.Deserialize<RuntimeSettings>(await File.ReadAllTextAsync(settingsPath))!;
@@ -19,6 +19,7 @@ internal static class ModelValidation
         await runtimes.EnsureAsync(settings, false, ct);
         await runtimes.EnsureAsync(settings, true, ct);
         var startupMs = coldStart.Elapsed.TotalMilliseconds;
+        await using var resources = new RuntimeResourceMonitor(runtimes);
         Console.WriteLine("Runtimes ready. Indexing configured source folders...");
         using var store = new SqliteSourceStore(Path.Combine(settings.DataDirectory, "sources.db"), settings.SqliteVecPath);
         var ingestor = new DocumentIngestor(store);
@@ -36,7 +37,7 @@ internal static class ModelValidation
         var generator = new PipeGenerator(generation, settings.GeneratorEndpoint);
         var rows = new List<object>();
         var times = new List<double>();
-        int totalWords = 0, totalErrors = 0;
+        int totalWords = 0, totalErrors = 0, domainTerms = 0, correctDomainTerms = 0;
         double totalAudio = 0, totalAsr = 0;
         var generations = new List<object>();
         for (var index = 0; index < samples.Length; index++)
@@ -47,37 +48,63 @@ internal static class ModelValidation
             Task<object>? generationTask = concurrent ? GenerateAsync(generator, ct) : null;
             var timer = Stopwatch.StartNew();
             var hypothesis = new StringBuilder();
-            await foreach (var text in asr.StreamAsync(new(Protocol.Version, sample.Id, settings.WhisperEndpoint, "transcribe", pcm), ct)) hypothesis.Append(text);
+            await foreach (var text in asr.StreamAsync(new(Protocol.Version, sample.Id, settings.WhisperEndpoint, "transcribe", pcm, SpeechVocabulary: settings.SpeechVocabulary, SpeechBeamSize: settings.WhisperBeamSize), ct)) hypothesis.Append(text);
             var elapsed = timer.Elapsed.TotalMilliseconds;
             var reference = Words(sample.Reference);
             var predicted = Words(hypothesis.ToString());
+            var domain = sample.DomainTerms ?? [];
+            var normalizedPrediction = " " + string.Join(' ', predicted) + " ";
+            var domainHits = domain.Count(term => normalizedPrediction.Contains(" " + string.Join(' ', Words(term)) + " ", StringComparison.Ordinal));
+            domainTerms += domain.Length; correctDomainTerms += domainHits;
             var errors = Distance(reference, predicted);
             var duration = pcm.Length / 32000d;
             rows.Add(new { sample.Id, sample.Meeting, sample.Row, audioSeconds = duration, concurrentGeneration = concurrent,
-                latencyMs = elapsed, realTimeFactor = elapsed / 1000 / duration, referenceWords = reference.Length, wordErrors = errors });
+                latencyMs = elapsed, realTimeFactor = elapsed / 1000 / duration, referenceWords = reference.Length, wordErrors = errors,
+                domainTerms = domain.Length, correctDomainTerms = domainHits });
             totalWords += reference.Length; totalErrors += errors; totalAudio += duration; totalAsr += elapsed; times.Add(elapsed);
             if (generationTask is not null) generations.Add(await generationTask);
             Console.WriteLine($"Sample {index + 1}/{samples.Length}: {elapsed:F0} ms, {errors}/{reference.Length} word errors{(concurrent ? ", concurrent generation" : "")}");
         }
         times.Sort();
+        Console.WriteLine("Checking real-model answer routing...");
+        var answerService = new AnswerService(hybrid, generator);
+        var answerChecks = new List<object>();
+        foreach (var scenario in new[]
+        {
+            (Question: "What is quantum entanglement?", General: true, Expected: AnswerBasis.GeneralKnowledge),
+            (Question: "What is our confidential ZephyrX budget today?", General: true, Expected: AnswerBasis.NeedsSource),
+            (Question: "What is quantum entanglement?", General: false, Expected: AnswerBasis.NeedsSource)
+        })
+        {
+            var state = new ConversationState();
+            state.Add(new("validation", "typed", scenario.Question, TimeSpan.Zero, TimeSpan.Zero, 1, DateTimeOffset.UtcNow));
+            var timer = Stopwatch.StartNew();
+            var answer = await answerService.AnswerAsync(state.Snapshot(), "concise", scenario.General, WorkPriority.UserGeneration, ct);
+            var passed = answer.Basis == scenario.Expected && answer.Sources.Count == 0;
+            answerChecks.Add(new { scenario.Question, scenario.General, basis = answer.Basis.ToString(), passed, latencyMs = timer.Elapsed.TotalMilliseconds, answer.Text });
+            Console.WriteLine($"{(passed ? "PASS" : "FAIL")}: {scenario.Question} -> {answer.Basis}");
+            if (!passed) throw new Exception("Answer routing failed for: " + scenario.Question);
+        }
         var report = new
         {
             timestamp = DateTimeOffset.UtcNow, corpus = "edinburghcstr/ami ihm/test",
             corpusUrl = "https://huggingface.co/datasets/edinburghcstr/ami",
             selection = "First four excerpts of 2-10 seconds and at least six words at offsets 0,1500,3000; no accuracy-based selection.",
-            settings.Threads, settings.WhisperModel, settings.GeneratorModel, settings.EmbeddingModel,
+            settings.Threads, settings.WhisperAudioContext, settings.WhisperBeamSize, settings.WhisperModel, settings.GeneratorModel, settings.EmbeddingModel,
             coldStartupMs = startupMs, sampleCount = samples.Length, totalAudioSeconds = totalAudio,
             referenceWords = totalWords, wordErrors = totalErrors, wordErrorRate = (double)totalErrors / totalWords,
-            medianAsrMs = times[times.Count / 2], maxAsrMs = times[^1], aggregateRealTimeFactor = totalAsr / 1000 / totalAudio,
+            medianAsrMs = (times[(times.Count - 1) / 2] + times[times.Count / 2]) / 2, maxAsrMs = times[^1], aggregateRealTimeFactor = totalAsr / 1000 / totalAudio,
             retrievalMs, retrievalEvidenceCount = retrieval.Count, nativeProcesses = runtimes.Metrics(),
-            samples = rows, generations,
+            resources = await resources.CompleteAsync(), domainTerms, correctDomainTerms,
+            domainTermAccuracy = domainTerms == 0 ? (double?)null : (double)correctDomainTerms / domainTerms,
+            samples = rows, generations, answerChecks,
             limits = "Small public headset-microphone meeting sample; not a certification for every accent, conferencing codec, microphone, or live user call. Startup excluded from warm inference latency. Last four samples start a generation concurrently. Audio capture verified separately."
         };
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(reportPath))!);
         await File.WriteAllTextAsync(reportPath, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }), ct);
         Console.WriteLine($"Report saved: {reportPath}");
     }
-    private static async Task<object> GenerateAsync(IGenerator generator, CancellationToken ct)
+    private static async Task<object> GenerateAsync(PipeGenerator generator, CancellationToken ct)
     {
         var source = new SourceReference("fixture", "file", "validation-fixture", "Validation fixture", null, "", null, 0);
         var evidence = new EvidenceChunk("fixture:0", "Orion's release is planned for Friday. The approved budget is 25000 dollars. Maya owns the rollout.", source, 1);
@@ -90,45 +117,10 @@ internal static class ModelValidation
         { firstToken ??= timer.Elapsed.TotalMilliseconds; output.Append(token); }
         var text = output.ToString();
         return new { firstTokenMs = firstToken, completionMs = timer.Elapsed.TotalMilliseconds, response = text,
-            cited = text.Contains("[1]"), correctDate = text.Contains("Friday", StringComparison.OrdinalIgnoreCase), correctOwner = text.Contains("Maya", StringComparison.OrdinalIgnoreCase) };
+            cited = text.Contains("[1]"), correctDate = text.Contains("Friday", StringComparison.OrdinalIgnoreCase), correctOwner = text.Contains("Maya", StringComparison.OrdinalIgnoreCase),
+            outputTokens = generator.LastTelemetry?.OutputTokens, tokensPerSecond = generator.LastTelemetry?.TokensPerSecond };
     }
-    public static byte[] ReadPcm(string path)
-    {
-        using var reader = new BinaryReader(File.OpenRead(path));
-        if (Encoding.ASCII.GetString(reader.ReadBytes(4)) != "RIFF") throw new Exception("Expected WAV.");
-        reader.ReadInt32();
-        if (Encoding.ASCII.GetString(reader.ReadBytes(4)) != "WAVE") throw new Exception("Expected WAV.");
-        var valid = false;
-        var floatingPoint = false;
-        while (reader.BaseStream.Position + 8 <= reader.BaseStream.Length)
-        {
-            var chunk = Encoding.ASCII.GetString(reader.ReadBytes(4)); var length = reader.ReadInt32();
-            var end = reader.BaseStream.Position + length;
-            if (length < 0 || end > reader.BaseStream.Length) throw new Exception("Invalid WAV chunk.");
-            if (chunk == "fmt ")
-            {
-                var format = reader.ReadInt16(); var channels = reader.ReadInt16(); var rate = reader.ReadInt32();
-                reader.ReadInt32(); reader.ReadInt16(); var bits = reader.ReadInt16();
-                floatingPoint = format == 3 && bits == 32;
-                valid = channels == 1 && rate == 16000 && ((format == 1 && bits == 16) || floatingPoint);
-            }
-            if (chunk == "data")
-            {
-                if (!valid) throw new Exception("Samples must be mono PCM16 or float32 WAV at 16 kHz.");
-                var audio = reader.ReadBytes(length);
-                if (!floatingPoint) return audio;
-                var pcm = new byte[audio.Length / 2];
-                for (var i = 0; i < audio.Length / 4; i++)
-                {
-                    var value = (short)(Math.Clamp(BitConverter.ToSingle(audio, i * 4), -1f, 1f) * short.MaxValue);
-                    pcm[i * 2] = (byte)value; pcm[i * 2 + 1] = (byte)(value >> 8);
-                }
-                return pcm;
-            }
-            reader.BaseStream.Position = end + (length % 2);
-        }
-        throw new Exception("No WAV audio data.");
-    }
+    public static byte[] ReadPcm(string path) => WaveAudio.ReadPcm(path);
     private static string[] Words(string text) => Regex.Matches(text.ToLowerInvariant(), "[a-z0-9']+").Select(x => x.Value.Trim('\'')).Where(x => x.Length > 0).ToArray();
     private static int Distance(string[] expected, string[] actual)
     {

@@ -1,16 +1,41 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
 
 namespace MeetingTeleprompter.Core;
 
+public sealed record RuntimeMetric(string Runtime, int ProcessId, long WorkingSetBytes, long PeakWorkingSetBytes, double CpuSeconds);
+
 public sealed class NativeRuntimeManager : IAsyncDisposable
 {
-    private readonly Dictionary<string, Process> _processes = new();
+    private readonly ConcurrentDictionary<string, Process> _processes = new();
     private readonly SemaphoreSlim _gate = new(1);
-    public object[] Metrics() => _processes.Select(pair =>
+    public bool IsRunning(string capability) => _processes.TryGetValue(capability, out var process) && !process.HasExited;
+    public async Task EnsureSpeechAsync(RuntimeSettings settings, CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (settings.WhisperModel.Length > 0)
+                await StartAsync("whisper", settings.WhisperExecutable, settings.WhisperModel, settings.WhisperEndpoint,
+                    ["-ng", "-t", settings.Threads.ToString(), "-ac", settings.WhisperAudioContext.ToString(), "-bo", "1"], ct);
+        }
+        finally { _gate.Release(); }
+    }
+    public async Task EnsureGenerationAsync(RuntimeSettings settings, CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (settings.GeneratorModel.Length > 0)
+                await StartAsync("generator", settings.LlamaExecutable, settings.GeneratorModel, settings.GeneratorEndpoint,
+                    ["-ngl", "0", "-c", "2048", "-np", "1", "-t", settings.Threads.ToString()], ct);
+        }
+        finally { _gate.Release(); }
+    }
+    public RuntimeMetric[] Metrics() => _processes.Select(pair =>
     {
         pair.Value.Refresh();
-        return (object)new { runtime = pair.Key, processId = pair.Value.Id, workingSetBytes = pair.Value.WorkingSet64,
-            peakWorkingSetBytes = pair.Value.PeakWorkingSet64, cpuSeconds = pair.Value.TotalProcessorTime.TotalSeconds };
+        return new RuntimeMetric(pair.Key, pair.Value.Id, pair.Value.WorkingSet64, pair.Value.PeakWorkingSet64, pair.Value.TotalProcessorTime.TotalSeconds);
     }).ToArray();
     public async Task EnsureAsync(RuntimeSettings settings, bool embeddings, CancellationToken ct)
     {
@@ -27,7 +52,7 @@ public sealed class NativeRuntimeManager : IAsyncDisposable
             {
                 if (settings.WhisperModel.Length > 0)
                     await StartAsync("whisper", settings.WhisperExecutable, settings.WhisperModel, settings.WhisperEndpoint,
-                        ["-ng", "-t", settings.Threads.ToString()], ct);
+                        ["-ng", "-t", settings.Threads.ToString(), "-ac", settings.WhisperAudioContext.ToString(), "-bo", "1"], ct);
                 if (settings.GeneratorModel.Length > 0)
                     await StartAsync("generator", settings.LlamaExecutable, settings.GeneratorModel, settings.GeneratorEndpoint,
                         ["-ngl", "0", "-c", "2048", "-np", "1", "-t", settings.Threads.ToString()], ct);
@@ -42,6 +67,17 @@ public sealed class NativeRuntimeManager : IAsyncDisposable
         if (!File.Exists(executable)) throw new FileNotFoundException("Select the local runtime executable in Settings.", executable);
         if (!File.Exists(model)) throw new FileNotFoundException("Select the local model file in Settings.", model);
         var uri = RuntimeSettings.LocalUri(endpoint);
+        using (var probe = new System.Net.Sockets.TcpClient())
+        {
+            using var probeTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeTimeout.CancelAfter(TimeSpan.FromSeconds(1));
+            var occupied = false;
+            try { await probe.ConnectAsync(uri.Host, uri.Port, probeTimeout.Token); occupied = true; }
+            catch (System.Net.Sockets.SocketException) { }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+            if (occupied) throw new InvalidOperationException($"Port {uri.Port} is already in use. Close the other Teleprompter instance, choose another endpoint, or clear the model path to attach to an externally managed server.");
+        }
+        ct.ThrowIfCancellationRequested();
         var start = new ProcessStartInfo(Path.GetFullPath(executable))
         {
             UseShellExecute = false, CreateNoWindow = true,
@@ -76,7 +112,27 @@ public sealed class NativeRuntimeManager : IAsyncDisposable
         catch
         {
             if (!process.HasExited) process.Kill(true);
-            _processes.Remove(name); process.Dispose(); throw;
+            _processes.TryRemove(name, out _); process.Dispose(); throw;
+        }
+    }
+    // Window.Closed cannot await cleanup: the UI process may exit before an async
+    // continuation gets a chance to stop its native child processes.
+    public void StopOwnedProcesses()
+    {
+        foreach (var pair in _processes.ToArray())
+        {
+            if (!_processes.TryRemove(pair.Key, out var process)) continue;
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                    process.WaitForExit(3000);
+                }
+            }
+            catch (InvalidOperationException) { /* process exited during cleanup */ }
+            catch (System.ComponentModel.Win32Exception) { /* process exited during cleanup */ }
+            finally { process.Dispose(); }
         }
     }
     public async ValueTask DisposeAsync()
@@ -84,12 +140,7 @@ public sealed class NativeRuntimeManager : IAsyncDisposable
         await _gate.WaitAsync();
         try
         {
-            foreach (var process in _processes.Values)
-            {
-                if (!process.HasExited) { process.Kill(true); await process.WaitForExitAsync(); }
-                process.Dispose();
-            }
-            _processes.Clear();
+            StopOwnedProcesses();
         }
         finally { _gate.Release(); }
     }

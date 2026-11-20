@@ -16,7 +16,7 @@ internal static class AudioValidation
             var settings = JsonSerializer.Deserialize<RuntimeSettings>(await File.ReadAllTextAsync(settingsPath))! with { Microphone = false, GeneratorModel = "" };
             await using var runtimes = new NativeRuntimeManager();
             using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(3));
-            await runtimes.EnsureAsync(settings, false, deadline.Token);
+            await runtimes.EnsureSpeechAsync(settings, deadline.Token);
             var source = new WasapiAudioSource(settings);
             var listening = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var health = new List<string>();
@@ -35,11 +35,11 @@ internal static class AudioValidation
             using var playback = new WasapiOut(outputDevice, AudioClientShareMode.Shared, true, 100);
             var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             playback.PlaybackStopped += (_, e) => { if (e.Exception is null) stopped.TrySetResult(); else stopped.TrySetException(e.Exception); };
-            playback.Init(new PaddedWave(input));
+            playback.Init(input);
             var timer = Stopwatch.StartNew();
             playback.Play();
             await stopped.Task.WaitAsync(deadline.Token);
-            await Task.Delay(750, deadline.Token);
+            await Task.Delay(1500, deadline.Token);
             captureLifetime.Cancel();
             await capture;
             var captureMs = timer.Elapsed.TotalMilliseconds;
@@ -60,17 +60,5 @@ internal static class AudioValidation
         catch (Exception error) { report = new { passed = false, error = error.ToString(), microphoneCaptured = false }; }
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(reportPath))!);
         await File.WriteAllTextAsync(reportPath, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
-    }
-    private sealed class PaddedWave(WaveFileReader source) : IWaveProvider
-    {
-        private int _padding = source.WaveFormat.AverageBytesPerSecond * 2;
-        public WaveFormat WaveFormat => source.WaveFormat;
-        public int Read(byte[] buffer, int offset, int count)
-        {
-            var read = source.Read(buffer, offset, count);
-            if (read > 0) return read;
-            var zeros = Math.Min(count, _padding);
-            Array.Clear(buffer, offset, zeros); _padding -= zeros; return zeros;
-        }
     }
 }

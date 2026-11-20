@@ -10,7 +10,12 @@ public sealed class UrlSafetyPolicy
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(15);
 }
 
-public sealed class SafeUrlFetcher(UrlSafetyPolicy policy)
+public interface IWebSourceFetcher
+{
+    Task<(Uri FinalUri, string ContentType, byte[] Content)> FetchAsync(Uri uri, CancellationToken cancellationToken);
+}
+
+public sealed class SafeUrlFetcher(UrlSafetyPolicy policy, HttpMessageHandler? transport = null) : IWebSourceFetcher
 {
     public static void ValidateUri(Uri uri)
     {
@@ -38,12 +43,15 @@ public sealed class SafeUrlFetcher(UrlSafetyPolicy policy)
     }
 
     public async Task<(Uri FinalUri, string ContentType, byte[] Content)> FetchAsync(Uri uri, CancellationToken cancellationToken)
+        => await FetchAsync(uri, null, cancellationToken);
+
+    public async Task<(Uri FinalUri, string ContentType, byte[] Content)> FetchAsync(Uri uri, Uri? requiredOrigin, CancellationToken cancellationToken)
     {
         ValidateUri(uri);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(policy.Timeout);
         var ct = deadline.Token;
-        using var handler = new SocketsHttpHandler
+        using var handler = transport ?? new SocketsHttpHandler
         {
             AllowAutoRedirect = false, UseProxy = false, AutomaticDecompression = DecompressionMethods.None,
             ConnectCallback = async (context, token) =>
@@ -62,6 +70,8 @@ public sealed class SafeUrlFetcher(UrlSafetyPolicy policy)
         for (var redirects = 0; redirects <= policy.MaxRedirects; redirects++)
         {
             ValidateUri(current);
+            if (requiredOrigin is not null && current.GetLeftPart(UriPartial.Authority) != requiredOrigin.GetLeftPart(UriPartial.Authority))
+                throw new InvalidOperationException("Browser resources must stay on the supplied page's origin.");
             using var response = await client.GetAsync(current, HttpCompletionOption.ResponseHeadersRead, ct);
             if ((int)response.StatusCode is >= 300 and < 400)
             {
@@ -69,6 +79,7 @@ public sealed class SafeUrlFetcher(UrlSafetyPolicy policy)
                 continue;
             }
             response.EnsureSuccessStatusCode();
+            if (response.Content.Headers.ContentLength == 0) return (current, response.Content.Headers.ContentType?.MediaType ?? "", []);
             if (response.Content.Headers.ContentEncoding.Count > 0) throw new InvalidOperationException("Compressed responses are not supported.");
             if (response.Content.Headers.ContentLength > policy.MaxBytes) throw new InvalidOperationException("Source exceeds 10 MB.");
             await using var stream = await response.Content.ReadAsStreamAsync(ct);

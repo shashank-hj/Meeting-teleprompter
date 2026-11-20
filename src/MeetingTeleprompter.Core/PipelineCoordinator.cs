@@ -4,8 +4,8 @@ public sealed class PipelineCoordinator : IAsyncDisposable
 {
     private readonly IAudioSource _audio;
     private readonly ITranscriber _transcriber;
-    private readonly IRetriever _retriever;
-    private readonly IGenerator _generator;
+    private readonly AnswerService _answers;
+    public bool AllowGeneralKnowledge { get; set; } = true;
     private readonly TranscriptStabilizer _stabilizer = new();
     private readonly ConversationState _conversation = new();
     private readonly TriggerEngine _triggers = new(TimeSpan.FromSeconds(8));
@@ -16,14 +16,20 @@ public sealed class PipelineCoordinator : IAsyncDisposable
     private Task? _capture;
     private long _revision;
     private bool _manualActive;
+    private bool _answeringQuestion;
+    private string _proactiveTopic = "";
+    private string _suggestionSegment = "";
     public event Action<TranscriptEvent>? PartialTranscript;
     public event Action<StableUtterance>? StableTranscript;
     public event Action<Suggestion>? SuggestionReady;
+    public event Action<long, string, AnswerBasis?, string>? SuggestionProgress;
+    public event Action<long>? SuggestionCompleted;
     public event Action<string>? StatusChanged;
 
     public PipelineCoordinator(IAudioSource audio, ITranscriber transcriber, IRetriever retriever, IGenerator generator)
     {
-        (_audio, _transcriber, _retriever, _generator) = (audio, transcriber, retriever, generator);
+        (_audio, _transcriber) = (audio, transcriber);
+        _answers = new(retriever, generator);
         _scheduler.Failed += ex => StatusChanged?.Invoke("Assistance unavailable: " + ex.Message);
     }
     public Task StartAsync(CancellationToken ct = default)
@@ -42,11 +48,19 @@ public sealed class PipelineCoordinator : IAsyncDisposable
                         lock (_gate)
                         {
                             _conversation.Add(stable);
-                            var decision = _triggers.Evaluate(stable, _conversation.Snapshot());
-                            // Continuing the same topic should not starve a useful generation.
-                            if (!_manualActive && decision.Novelty >= .8) { _suggestion?.Cancel(); _revision++; }
-                            if (decision.ShouldGenerate && !_manualActive)
-                                QueueSuggestion("concise", false);
+                            var decision = stable.IsCorrection ? new TriggerDecision(false, "correction", 0) : _triggers.Evaluate(stable, _conversation.Snapshot());
+                            if (stable.IsCorrection && _suggestionSegment == stable.Channel + ":" + stable.SegmentId)
+                                CancelSuggestion();
+                            // Cooldowns prevent replacement work; they must not keep obsolete work alive.
+                            if (_suggestion is not null && !_manualActive && !_answeringQuestion &&
+                                stable.Confidence >= .4 && TriggerEngine.IsTopicShift(_proactiveTopic, stable.Text))
+                            {
+                                CancelSuggestion();
+                                StatusChanged?.Invoke("Ready · topic changed; previous draft cancelled.");
+                            }
+                            // Only a newer question may replace an answer to a question in progress.
+                            if (decision.ShouldGenerate && !_manualActive && (!_answeringQuestion || decision.Reason == "question"))
+                                QueueSuggestion("concise", false, answerQuestion: decision.Reason == "question");
                         }
                         StableTranscript?.Invoke(stable);
                     }
@@ -55,11 +69,13 @@ public sealed class PipelineCoordinator : IAsyncDisposable
             catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
         });
     }
-    public void RequestSuggestion(string route = "concise") { lock (_gate) QueueSuggestion(route, true); }
-    public void CancelSuggestion() { lock (_gate) { _suggestion?.Cancel(); _revision++; _manualActive = false; } }
-    private void QueueSuggestion(string route, bool manual)
+    public void RequestSuggestion(string route = "concise", string? question = null) { lock (_gate) QueueSuggestion(route, true, question); }
+    public void CancelSuggestion() { lock (_gate) { _suggestion?.Cancel(); SuggestionCompleted?.Invoke(_revision); _revision++; _manualActive = false; _answeringQuestion = false; } }
+    private void QueueSuggestion(string route, bool manual, string? question = null, bool answerQuestion = false)
     {
         var snapshot = _conversation.Snapshot();
+        if (!string.IsNullOrWhiteSpace(question))
+            snapshot = snapshot with { RecentUtterances = snapshot.RecentUtterances.Append(new StableUtterance(Guid.NewGuid().ToString("N"), "typed", question, TimeSpan.Zero, TimeSpan.Zero, 1, DateTimeOffset.UtcNow)).TakeLast(12).ToArray() };
         if (snapshot.RecentUtterances.Count == 0) { StatusChanged?.Invoke("Waiting for speech."); return; }
         _suggestion?.Cancel();
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
@@ -67,6 +83,12 @@ public sealed class PipelineCoordinator : IAsyncDisposable
         var revision = ++_revision;
         _manualActive = manual;
         var priority = manual ? WorkPriority.UserGeneration : WorkPriority.ProactiveGeneration;
+        var allowGeneral = AllowGeneralKnowledge;
+        _answeringQuestion = answerQuestion;
+        var asked = snapshot.RecentUtterances[^1].Text;
+        _suggestionSegment = snapshot.RecentUtterances[^1].Channel + ":" + snapshot.RecentUtterances[^1].SegmentId;
+        _proactiveTopic = asked;
+        SuggestionProgress?.Invoke(revision, asked, null, "");
         if (!_scheduler.Enqueue(priority, async workerToken =>
         {
             using (cancellation)
@@ -76,34 +98,25 @@ public sealed class PipelineCoordinator : IAsyncDisposable
                 {
                     linked.CancelAfter(TimeSpan.FromSeconds(60));
                     linked.Token.ThrowIfCancellationRequested();
-                    var query = snapshot.RecentUtterances.Last().Text;
-                    var evidence = await _retriever.SearchAsync(query, 5, linked.Token);
-                    if (evidence.Count == 0) { if (manual) StatusChanged?.Invoke("No supporting evidence in your sources."); return; }
-                    var text = new System.Text.StringBuilder();
-                    if (route == "evidence") text.Append(string.Join("\n\n", evidence.Select((x, i) => $"[{i + 1}] {x.Text}")));
-                    else
-                    {
-                        var request = new SuggestionRequest(Guid.NewGuid().ToString("N"), priority, route, snapshot, evidence, linked.Token);
-                        await foreach (var token in _generator.StreamAsync(request, linked.Token)) text.Append(token);
-                    }
+                    var answer = await _answers.AnswerAsync(snapshot, route, allowGeneral && (manual || answerQuestion), priority, linked.Token,
+                        message => { if (!linked.IsCancellationRequested && revision == Interlocked.Read(ref _revision)) StatusChanged?.Invoke(message); },
+                        (basis, text) => { if (!linked.IsCancellationRequested && revision == Interlocked.Read(ref _revision)) SuggestionProgress?.Invoke(revision, asked, basis, text); });
                     lock (_gate)
                     {
                         if (revision != _revision || linked.IsCancellationRequested) return;
-                        var generated = route != "evidence";
-                        var citations = System.Text.RegularExpressions.Regex.Matches(text.ToString(), @"\[(\d+)\]");
-                        if (generated && (citations.Count == 0 || citations.Any(m => !int.TryParse(m.Groups[1].Value, out var number) || number < 1 || number > evidence.Count)))
-                        {
-                            generated = false;
-                            text.Clear().Append("The generated answer could not be linked reliably to evidence. Relevant passages:\n\n")
-                                .Append(string.Join("\n\n", evidence.Select((x, i) => $"[{i + 1}] {x.Text}")));
-                        }
-                        SuggestionReady?.Invoke(new(Guid.NewGuid().ToString("N"), text.ToString(), route, generated,
-                            evidence.Select(x => x.Source).ToArray(), DateTimeOffset.UtcNow));
+                        if (manual || answerQuestion || answer.Basis != AnswerBasis.NeedsSource) SuggestionReady?.Invoke(answer);
+                        StatusChanged?.Invoke("Ready · " + (answer.Basis == AnswerBasis.GeneralKnowledge ? "general answer — verify before using" : "sources checked"));
                     }
                 }
-                finally { lock (_gate) { if (ReferenceEquals(_suggestion, cancellation)) { _manualActive = false; _suggestion = null; } } }
+                catch (OperationCanceledException) when (!cancellation.IsCancellationRequested && !workerToken.IsCancellationRequested)
+                { StatusChanged?.Invoke("Ready · suggestion timed out. Choose a shorter route or a faster model profile."); }
+                finally
+                {
+                    lock (_gate) { if (ReferenceEquals(_suggestion, cancellation)) { _manualActive = false; _answeringQuestion = false; _suggestion = null; } }
+                    SuggestionCompleted?.Invoke(revision);
+                }
             }
-        })) { cancellation.Dispose(); _suggestion = null; _manualActive = false; StatusChanged?.Invoke("Assistance queue is full."); }
+        })) { cancellation.Dispose(); _suggestion = null; _manualActive = false; _answeringQuestion = false; SuggestionCompleted?.Invoke(revision); StatusChanged?.Invoke("Assistance queue is full."); }
     }
     public async ValueTask DisposeAsync()
     {

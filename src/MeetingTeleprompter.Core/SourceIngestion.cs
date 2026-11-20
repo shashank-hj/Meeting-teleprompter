@@ -10,7 +10,16 @@ public sealed record SourceDocument(
     string Title,
     DateTimeOffset UpdatedAt,
     string ContentHash,
-    IReadOnlyList<DocumentChunk> Chunks);
+    IReadOnlyList<DocumentChunk> Chunks,
+    string Status = "indexed",
+    string? LastError = null,
+    DateTimeOffset? LastAttemptAt = null,
+    int ParserVersion = 2)
+{
+    public string StatusDescription => Status == "failed"
+        ? (ContentHash.Length > 0 ? "Refresh failed · saved copy retained" : "Import failed · refresh to retry")
+        : (Type == "url" ? "Saved " : "Indexed ") + UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+}
 
 public sealed record DocumentChunk(
     string Id,
@@ -36,25 +45,46 @@ public sealed class DocumentChunker(int targetCharacters = 1200, int overlapChar
 {
     public IReadOnlyList<DocumentChunk> Chunk(string sourceId, string text)
     {
-        var normalized = string.Join('\n', text.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0));
+        if (targetCharacters < 32 || overlapCharacters < 0 || overlapCharacters >= targetCharacters)
+            throw new ArgumentOutOfRangeException(nameof(targetCharacters), "Chunk overlap must be smaller than its target size.");
         var chunks = new List<DocumentChunk>();
-        var start = 0;
-        var index = 0;
-        while (start < normalized.Length)
+        var heading = string.Empty;
+        var section = new StringBuilder();
+        foreach (var line in text.Replace("\r\n", "\n").Split('\n'))
         {
-            var end = Math.Min(start + targetCharacters, normalized.Length);
-            if (end < normalized.Length)
+            var trimmed = line.Trim();
+            if (System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^#{1,6}\s+"))
             {
-                var boundary = normalized.LastIndexOfAny([' ', '\n', '.', ',', ';'], end - 1, Math.Min(120, end - start));
-                if (boundary > start + targetCharacters / 2) end = boundary + 1;
+                Flush();
+                heading = trimmed.TrimStart('#', ' ').TrimEnd('#', ' ');
             }
-            var value = normalized[start..end].Trim();
-            if (value.Length > 0)
-                chunks.Add(new DocumentChunk($"{sourceId}:{index}", index++, value, null, string.Empty));
-            if (end >= normalized.Length) break;
-            start = Math.Max(end - overlapCharacters, start + 1);
+            else section.AppendLine(trimmed);
         }
+        Flush();
         return chunks;
+
+        void Flush()
+        {
+            var normalized = section.ToString().Trim();
+            section.Clear();
+            var start = 0;
+            while (start < normalized.Length)
+            {
+                var end = Math.Min(start + targetCharacters, normalized.Length);
+                if (end < normalized.Length)
+                {
+                    // Prefer paragraph/list boundaries, then words, without crossing a heading.
+                    var boundary = normalized.LastIndexOf('\n', end - 1, end - start);
+                    if (boundary < start + targetCharacters / 2)
+                        boundary = normalized.LastIndexOfAny([' ', '.', ',', ';'], end - 1, Math.Min(120, end - start));
+                    if (boundary > start + targetCharacters / 2) end = boundary + 1;
+                }
+                var value = normalized[start..end].Trim();
+                if (value.Length > 0) chunks.Add(new($"{sourceId}:{chunks.Count}", chunks.Count, value, null, heading));
+                if (end >= normalized.Length) break;
+                start = Math.Max(end - overlapCharacters, start + 1);
+            }
+        }
     }
 
     public static string Hash(string content)

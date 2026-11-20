@@ -1,3 +1,4 @@
+param([string]$GeneratorModelPath)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $modelDirectory = Join-Path $projectRoot 'models'
@@ -29,15 +30,18 @@ Download-Checked 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml
 Download-Checked 'https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf' (Join-Path $modelDirectory 'embeddinggemma-300M-Q8_0.gguf') 'b5ce9d77a3fc4b3b39ccb5643c36777911cc4eb46a66962eadfa3f5f60490d63'
 $sileroUri = 'https://raw.githubusercontent.com/snakers4/silero-vad/7e30209a3e901f9842f81b225f3e93d8199902b1/src/silero_vad/data/silero_vad.onnx'
 $sileroPath = Join-Path $modelDirectory 'silero_vad.onnx'
-if (-not (Test-Path -LiteralPath $sileroPath)) {
-    & curl.exe --fail --location --retry 3 --silent --show-error --output $sileroPath $sileroUri
-    if ($LASTEXITCODE -ne 0) { throw 'Silero download failed.' }
-}
+Download-Checked $sileroUri $sileroPath '1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3'
 $ollamaManifest = Join-Path $env:USERPROFILE '.ollama/models/manifests/registry.ollama.ai/library/gemma2/2b'
-$manifest = Get-Content -LiteralPath $ollamaManifest -Raw | ConvertFrom-Json
-$modelLayer = $manifest.layers | Where-Object mediaType -eq 'application/vnd.ollama.image.model'
-$generationPath = Join-Path $env:USERPROFILE ('.ollama/models/blobs/' + $modelLayer.digest.Replace(':','-'))
-if (-not (Test-Path -LiteralPath $generationPath)) { throw 'Existing Gemma 2 model blob is missing.' }
+$generationPath = $GeneratorModelPath
+if (-not $generationPath -and (Test-Path -LiteralPath $ollamaManifest)) {
+    $manifest = Get-Content -LiteralPath $ollamaManifest -Raw | ConvertFrom-Json
+    $modelLayer = $manifest.layers | Where-Object mediaType -eq 'application/vnd.ollama.image.model'
+    $generationPath = Join-Path $env:USERPROFILE ('.ollama/models/blobs/' + $modelLayer.digest.Replace(':','-'))
+}
+if (-not $generationPath -or -not (Test-Path -LiteralPath $generationPath)) {
+    throw 'Supply -GeneratorModelPath with a compatible instruct GGUF whose license you have accepted, or install the Gemma 2 2B cache used on this machine.'
+}
+$generationPath = (Resolve-Path -LiteralPath $generationPath).Path
 $settingsDirectory = Join-Path $env:LOCALAPPDATA 'MeetingTeleprompter'
 New-Item -ItemType Directory -Force -Path $settingsDirectory | Out-Null
 $settingsPath = Join-Path $settingsDirectory 'settings.json'
@@ -60,7 +64,9 @@ $settings.SileroModelPath = $sileroPath
 $settings.SqliteVecPath = (Get-ChildItem (Join-Path $runtimeDirectory 'sqlite-vec') -Recurse -Filter vec0.dll | Select-Object -First 1).FullName
 $settings.SemanticSearch = $true
 $settings.Threads = 2
+$settings.WhisperAudioContext = 512
 if (-not $settings.ContainsKey('Microphone')) { $settings.Microphone = $true }
+if (-not $settings.ContainsKey('ConserveMemory')) { $settings.ConserveMemory = $true }
 if (-not $settings.ContainsKey('DataDirectory')) { $settings.DataDirectory = $settingsDirectory }
 if (-not $settings.ContainsKey('Folders')) { $settings.Folders = @((Join-Path $projectRoot 'knowledge_base')) }
 if (-not $settings.WhisperExecutable -or -not $settings.LlamaExecutable) { throw 'Runtime executables not present in downloaded archives.' }

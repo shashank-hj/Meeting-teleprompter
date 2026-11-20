@@ -3,7 +3,7 @@ using MeetingTeleprompter.Core;
 
 internal static class AcceptanceTests
 {
-    public static async Task RunAsync()
+    public static async Task RunAsync(bool withBrowser = false)
     {
         var passed = 0;
         void Check(bool condition, string name)
@@ -51,6 +51,13 @@ internal static class AcceptanceTests
             var state = new ConversationState(); state.Add(utterance);
             Check(engine.Evaluate(utterance, state.Snapshot()).ShouldGenerate, "proactive trigger without question");
             Check(!engine.Evaluate(utterance, state.Snapshot()).ShouldGenerate, "trigger cooldown");
+            var firstQuestion = utterance with { SegmentId = "question-1", Text = "What is the Orion budget?" };
+            var secondQuestion = utterance with { SegmentId = "question-2", Text = "Who approved the Orion budget?" };
+            Check(engine.Evaluate(firstQuestion, state.Snapshot()).ShouldGenerate && engine.Evaluate(secondQuestion, state.Snapshot()).ShouldGenerate,
+                "distinct questions bypass the suggestion cooldown");
+            Check(!engine.Evaluate(secondQuestion, state.Snapshot()).ShouldGenerate, "repeated question is not answered twice");
+            Check(engine.Evaluate(utterance with { Text = "The budget is approved" }, state.Snapshot()).Reason != "question",
+                "statements containing is are not treated as questions");
             var failed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             await using (var scheduler = new WorkScheduler())
             {
@@ -68,10 +75,11 @@ internal static class AcceptanceTests
             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             Directory.Delete(root, true);
         }
-        await PipelineTests.RunAsync();
-        passed++;
+        passed += await PipelineTests.RunAsync();
         await WorkerTests.RunAsync();
         passed++;
+        passed += await ImprovementTests.RunAsync();
+        passed += await ProposalTests.RunAsync(withBrowser);
         Console.WriteLine(passed + " acceptance checks passed.");
     }
 }

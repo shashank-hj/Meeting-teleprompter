@@ -22,8 +22,23 @@
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.23.2" />
     <ProjectReference Include="..\MeetingTeleprompter.Host\MeetingTeleprompter.Host.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
+  <Target Name="KeepBrowserRuntimeOutOfResourceIndex" AfterTargets="CopyPlaywrightFilesToOutput">
+    <ItemGroup>
+      <_BrowserRuntimeContent Include="@(Content)" Condition="'%(Content.NuGetPackageId)' == 'Microsoft.Playwright'" />
+      <Content Remove="@(_BrowserRuntimeContent)" />
+      <None Include="@(_BrowserRuntimeContent)" />
+    </ItemGroup>
+  </Target>
   <Target Name="CopyWorkers" AfterTargets="Build">
-    <ItemGroup><WorkerFiles Include="..\MeetingTeleprompter.Host\bin\$(Configuration)\net10.0\**\*" /></ItemGroup>
+    <MSBuild Projects="..\MeetingTeleprompter.Host\MeetingTeleprompter.Host.csproj" Targets="GetTargetPath" Properties="Configuration=$(Configuration)">
+      <Output TaskParameter="TargetOutputs" ItemName="_WorkerAssemblies" />
+    </MSBuild>
+    <PropertyGroup>
+      <_WorkerOutputDirectory>@(_WorkerAssemblies->'%(RootDir)%(Directory)')</_WorkerOutputDirectory>
+    </PropertyGroup>
+    <ItemGroup>
+      <WorkerFiles Include="$(_WorkerOutputDirectory)**\*" Exclude="$(_WorkerOutputDirectory).playwright\node\darwin-*\**;$(_WorkerOutputDirectory).playwright\node\linux-*\**" />
+    </ItemGroup>
     <Copy SourceFiles="@(WorkerFiles)" DestinationFiles="@(WorkerFiles->'$(OutDir)workers\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
   </Target>
 </Project>

@@ -6,8 +6,11 @@ using System.Text.Json;
 namespace MeetingTeleprompter.Core;
 
 public sealed record WorkerRequest(int Protocol, string Id, string Endpoint, string Operation, byte[]? Audio = null,
-    string? Route = null, ConversationSnapshot? Conversation = null, IReadOnlyList<EvidenceChunk>? Evidence = null);
-public sealed record WorkerResponse(int Protocol, string Id, string? Text = null, bool Done = false, string? Error = null);
+    string? Route = null, ConversationSnapshot? Conversation = null, IReadOnlyList<EvidenceChunk>? Evidence = null,
+    AnswerBasis Basis = AnswerBasis.Sources, string? SpeechVocabulary = null, int SpeechBeamSize = 1,
+    WorkPriority Priority = WorkPriority.UserGeneration, DateTimeOffset? Deadline = null);
+public sealed record WorkerResponse(int Protocol, string Id, string? Text = null, bool Done = false, string? Error = null, double? Confidence = null,
+    GenerationTelemetry? Telemetry = null);
 
 // One process per capability; a failed or cancelled request discards the worker.
 public sealed class PipeInferenceClient(string workerExecutable, string mode) : IAsyncDisposable
@@ -17,6 +20,8 @@ public sealed class PipeInferenceClient(string workerExecutable, string mode) : 
     private StreamReader? _reader;
     private StreamWriter? _writer;
     private readonly SemaphoreSlim _gate = new(1);
+    public double LastConfidence { get; private set; } = .5;
+    public GenerationTelemetry? LastTelemetry { get; private set; }
     private async Task ConnectAsync(CancellationToken ct)
     {
         if (_process is { HasExited: false } && _pipe?.IsConnected == true) return;
@@ -36,6 +41,8 @@ public sealed class PipeInferenceClient(string workerExecutable, string mode) : 
     {
         await _gate.WaitAsync(ct);
         var completed = false;
+        LastConfidence = .5;
+        LastTelemetry = null;
         try
         {
             await ConnectAsync(ct);
@@ -46,6 +53,8 @@ public sealed class PipeInferenceClient(string workerExecutable, string mode) : 
                 var response = JsonSerializer.Deserialize<WorkerResponse>(line) ?? throw new IOException("Invalid worker response.");
                 if (response.Protocol != Protocol.Version || response.Id != request.Id) throw new IOException("Worker protocol mismatch.");
                 if (response.Error is not null) throw new InvalidOperationException(response.Error);
+                if (response.Confidence is { } confidence) LastConfidence = confidence;
+                if (response.Telemetry is { } telemetry) LastTelemetry = telemetry;
                 if (response.Text is not null) yield return response.Text;
                 if (response.Done) { completed = true; break; }
             }
@@ -73,11 +82,13 @@ public sealed class PipeInferenceClient(string workerExecutable, string mode) : 
 
 public sealed class PipeGenerator(PipeInferenceClient worker, string endpoint) : IGenerator
 {
+    public GenerationTelemetry? LastTelemetry => worker.LastTelemetry;
     public IAsyncEnumerable<string> StreamAsync(SuggestionRequest request, CancellationToken ct) =>
-        worker.StreamAsync(new(Protocol.Version, request.RequestId, endpoint, "generate", Route: request.Route, Conversation: request.Conversation, Evidence: request.Evidence), ct);
+        worker.StreamAsync(new(Protocol.Version, request.RequestId, endpoint, "generate", Route: request.Route, Conversation: request.Conversation, Evidence: request.Evidence, Basis: request.Basis,
+            Priority: request.Priority, Deadline: DateTimeOffset.UtcNow.AddSeconds(60)), ct);
 }
 
-public sealed class PipeTranscriber(PipeInferenceClient worker, string endpoint) : ITranscriber
+public sealed class PipeTranscriber(PipeInferenceClient worker, string endpoint, string vocabulary = "", int beamSize = 1) : ITranscriber
 {
     public async IAsyncEnumerable<TranscriptEvent> TranscribeAsync(IAsyncEnumerable<AudioFrame> frames, [EnumeratorCancellation] CancellationToken ct)
     {
@@ -87,11 +98,11 @@ public sealed class PipeTranscriber(PipeInferenceClient worker, string endpoint)
             origin ??= frame.CapturedAt;
             var id = frame.Channel + ":" + frame.Sequence;
             var text = new System.Text.StringBuilder();
-            await foreach (var part in worker.StreamAsync(new(Protocol.Version, id, endpoint, "transcribe", frame.Pcm16KhzMono), ct)) text.Append(part);
+            await foreach (var part in worker.StreamAsync(new(Protocol.Version, id, endpoint, "transcribe", frame.Pcm16KhzMono, SpeechVocabulary: vocabulary, SpeechBeamSize: beamSize), ct)) text.Append(part);
             var start = frame.CapturedAt - origin.Value;
             if (text.Length > 0)
                 yield return new(id, frame.Channel, frame.IsFinal ? TranscriptKind.Final : TranscriptKind.Partial, text.ToString(), start,
-                    start + TimeSpan.FromSeconds(frame.Pcm16KhzMono.Length / 32000d), .5, DateTimeOffset.UtcNow);
+                    start + TimeSpan.FromSeconds(frame.Pcm16KhzMono.Length / 32000d), worker.LastConfidence, DateTimeOffset.UtcNow);
         }
     }
 }
